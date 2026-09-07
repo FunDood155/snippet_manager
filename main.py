@@ -11,25 +11,32 @@ snippets=[
 
 
 def add():
-     snippet={"sno":1,
-     "name":"snippet name",
-     "cat":"snippet category",
-     "code":"snippet content"}
-     print("Enter details of ",len(snippets)+1," th snippet")
-     snippet.update({"sno":len(snippets)+1})
-     x=input("Enter snippet name : ")
-     snippet.update({"name":x})
-     y=input("Enter snippet category : ")
-     snippet.update({"cat":y})
-     z=input("Enter snippet content : ")
-     snippet.update({"code":z})
-     snippets.append(snippet)
+     snippet = {
+          "sno": len(snippets) + 1,
+          "name": input("Enter snippet name : "),
+          "cat": input("Enter snippet category : "),
+          "code": input("Enter snippet content : ")
+     }
+     found=False
+     for i in snippets:
+          if(i["name"]==snippet["name"]):
+               print("Snippet already exists")
+               found=True
+               break
+     if not found:
+          snippets.append(snippet)
 
 def remove():
      x=input("Which snippet u wanna remove : ")
+     found = False
      for i in snippets:
-          if(i["name"]==x):
+          if i["name"] == x:
                snippets.remove(i)
+               print("Snippet ",x," removed")
+               found = True
+               break
+     if not found:
+          print("Snippet not found")
 
 def display():
     # print(snippets)
@@ -39,8 +46,11 @@ def display():
         print()
 
 def show_category():
+     categories = set()
      for i in snippets:
-          print(i["cat"])
+          categories.add(i["cat"])
+     for cat in categories:
+          print(cat)
 
 def show_snippets():
      for i in snippets:
