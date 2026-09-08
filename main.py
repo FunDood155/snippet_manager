@@ -1,115 +1,82 @@
+from flask import Flask, render_template, request, redirect
 import sqlite3
 
-
-# Connect to database
-conn = sqlite3.connect("snippets.db")
-cursor = conn.cursor()
+app = Flask(__name__)
 
 
-# Create table
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS snippets (
-    sno INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    cat TEXT,
-    code TEXT
-)
-""")
+@app.route("/")
+def home():
+    category = request.args.get("category")
+    search = request.args.get("search")
 
-conn.commit()
+    conn = sqlite3.connect("snippets.db")
+    cursor = conn.cursor()
 
-
-def add():
-    name = input("Enter snippet name : ")
-    cat = input("Enter snippet category : ")
-    code = input("Enter snippet content : ")
-
-    cursor.execute(
-        "SELECT * FROM snippets WHERE name = ?",
-        (name,)
-    )
-
-    if cursor.fetchone():
-        print("Snippet already exists")
-    else:
+    if search:
         cursor.execute(
-            "INSERT INTO snippets (name, cat, code) VALUES (?, ?, ?)",
-            (name, cat, code)
+            """
+            SELECT * FROM snippets
+            WHERE name LIKE ? OR code LIKE ?
+            """,
+            (f"%{search}%", f"%{search}%")
         )
-        conn.commit()
-        print("Snippet added")
 
-
-def remove():
-    x = input("Which snippet u wanna remove : ")
-
-    cursor.execute(
-        "SELECT * FROM snippets WHERE name = ?",
-        (x,)
-    )
-
-    if cursor.fetchone():
+    elif category:
         cursor.execute(
-            "DELETE FROM snippets WHERE name = ?",
-            (x,)
+            "SELECT * FROM snippets WHERE cat = ?",
+            (category,)
         )
-        conn.commit()
-        print("Snippet ", x, " removed")
+
     else:
-        print("Snippet not found")
-
-
-def display():
-    cursor.execute("SELECT * FROM snippets")
+        cursor.execute("SELECT * FROM snippets")
 
     snippets = cursor.fetchall()
 
-    for i in snippets:
-        print("Sno  : ", i[0])
-        print("Name : ", i[1])
-        print("Cat  : ", i[2])
-        print("Code : ", i[3])
-        print()
-
-
-def show_category():
     cursor.execute("SELECT DISTINCT cat FROM snippets")
-
     categories = cursor.fetchall()
 
-    for cat in categories:
-        print(cat[0])
+    conn.close()
+
+    return render_template(
+        "index.html",
+        snippets=snippets,
+        categories=categories
+    )
 
 
-def show_snippets():
-    cursor.execute("SELECT name FROM snippets")
+@app.route("/add", methods=["POST"])
+def add():
+    name = request.form["name"]
+    cat = request.form["cat"]
+    code = request.form["code"]
 
-    snippets = cursor.fetchall()
+    conn = sqlite3.connect("snippets.db")
+    cursor = conn.cursor()
 
-    for i in snippets:
-        print(i[0])
+    cursor.execute(
+        "INSERT INTO snippets (name, cat, code) VALUES (?, ?, ?)",
+        (name, cat, code)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return redirect("/")
 
 
-print("1.Add")
-print("2.Remove")
-print("3.Display")
-print("4.Show all category")
-print("5.Show all snippets")
+@app.route("/delete/<int:sno>", methods=["POST"])
+def delete(sno):
+    conn = sqlite3.connect("snippets.db")
+    cursor = conn.cursor()
 
-ch = True
-while ch:
-    ch = input("Enter ur choice : ")
-    if ch == '1':
-        add()
-    elif ch == '2':
-        remove()
-    elif ch == '3':
-        display()
-    elif ch == '4':
-        show_category()
-    elif ch == '5':
-        show_snippets()
-    else:
-        break
+    cursor.execute(
+        "DELETE FROM snippets WHERE sno = ?",
+        (sno,)
+    )
 
-conn.close()
+    conn.commit()
+    conn.close()
+
+    return redirect("/")
+
+app.run(debug=True)
