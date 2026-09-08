@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Code Snippet Manager</title>
+
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+
+    <div class="container">
+
+        <h1>Code Snippet Manager</h1>
+
+        <!-- Add Snippet -->
+
+        <div class="card">
+
+            <h2>Add New Snippet</h2>
+
+            <form action="/add" method="POST">
+
+                <input
+                    type="text"
+                    name="name"
+                    placeholder="Snippet name"
+                    required
+                >
+
+                <input
+                    type="text"
+                    name="cat"
+                    placeholder="Category"
+                    required
+                >
+
+                <textarea
+                    name="code"
+                    placeholder="Enter your code"
+                    rows="6"
+                    required
+                ></textarea>
+
+                <button type="submit">Add Snippet</button>
+
+            </form>
+
+        </div>
+
+
+        <!-- Search -->
+
+        <div class="card">
+
+            <h2>Search</h2>
+
+            <form action="/" method="GET">
+
+                <input
+                    type="text"
+                    name="search"
+                    placeholder="Search snippets..."
+                >
+
+                <button type="submit">Search</button>
+
+            </form>
+
+        </div>
+
+
+        <!-- Category -->
+
+        <div class="card">
+
+            <h2>Filter by Category</h2>
+
+            <form action="/" method="GET">
+
+                <select name="category">
+
+                    <option value="">All Categories</option>
+
+                    {% for category in categories %}
+
+                        <option value="{{ category[0] }}">
+                            {{ category[0] }}
+                        </option>
+
+                    {% endfor %}
+
+                </select>
+
+                <button type="submit">Filter</button>
+
+            </form>
+
+        </div>
+
+
+        <!-- Snippets -->
+
+        <h2 class="section-title">Your Snippets</h2>
+
+        {% for snippet in snippets %}
+
+            <div class="snippet">
+
+                <h2>{{ snippet[1] }}</h2>
+
+                <p class="category">
+                    Category: {{ snippet[2] }}
+                </p>
+
+                <pre>{{ snippet[3] }}</pre>
+
+                <form action="/delete/{{ snippet[0] }}" method="POST">
+
+                    <button class="delete" type="submit">
+                        Delete
+                    </button>
+
+                </form>
+
+            </div>
+
+        {% endfor %}
+
+    </div>
+
+</body>
+
+</html>
