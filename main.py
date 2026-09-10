@@ -3,7 +3,6 @@ import sqlite3
 
 app = Flask(__name__)
 
-
 @app.route("/")
 def home():
     category = request.args.get("category")
@@ -20,13 +19,11 @@ def home():
             """,
             (f"%{search}%", f"%{search}%")
         )
-
     elif category:
         cursor.execute(
             "SELECT * FROM snippets WHERE cat = ?",
             (category,)
         )
-
     else:
         cursor.execute("SELECT * FROM snippets")
 
