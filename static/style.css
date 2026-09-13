@@ -5,7 +5,8 @@
 body {
     margin: 0;
     font-family: Arial, sans-serif;
-    background: #f4f4f4;
+    /* background: #f4f4f4; */
+    background: #1c1c1c;
 }
 
 .container {
@@ -21,7 +22,8 @@ h1 {
 
 .card,
 .snippet {
-    background: white;
+    /* background: white; */
+    background: #585858;
     padding: 20px;
     margin-bottom: 20px;
     border-radius: 10px;
