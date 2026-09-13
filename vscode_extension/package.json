@@ -1,0 +1,55 @@
+{
+  "name": "code-snippet-manager",
+  "displayName": "Code Snippet Manager",
+  "description": "A VS Code extension for managing and inserting code snippets using a Flask API.",
+  "version": "0.0.1",
+  "publisher": "code-snippet-manager",
+  "engines": {
+    "vscode": "^1.137.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "code-snippet-manager.showSnippets",
+        "title": "Code Snippet Manager: Show Snippets"
+      },
+      {
+        "command": "code-snippet-manager.searchSnippets",
+        "title": "Code Snippet Manager: Search Snippets"
+      },
+      {
+        "command": "code-snippet-manager.insertSnippet",
+        "title": "Code Snippet Manager: Insert Snippet"
+      }
+    ]
+  },
+"scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test",
+    "package": "vsce package"
+},
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "@types/vscode": "^1.137.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
+    "@vscode/vsce": "^3.9.2",
+    "eslint": "^10.5.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  }
+}
