@@ -1,4 +1,3 @@
-````markdown
 # Code Snippet Manager
 
 A full-stack code snippet management application built with Flask, PostgreSQL, REST APIs, and a VS Code extension.
