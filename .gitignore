@@ -1,0 +1,4 @@
+.env
+snippets.db
+__pycache__/
+*.pyc
