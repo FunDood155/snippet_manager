@@ -69,20 +69,9 @@ The current production architecture is:
                          └─────────────────┘
 ````
 
-### Production flow
+The web application and VS Code extension both communicate with the Flask REST API. The API handles communication with the Supabase PostgreSQL database.
 
-```text
-Web Browser ────────→ Vercel
-                         ↓
-                    Flask REST API
-                         ↓
-                  Supabase PostgreSQL
-                         ↑
-                         │
-VS Code Extension ───────┘
-```
-
-The VS Code extension communicates with the REST API and does not access the database directly.
+The VS Code extension does not access the database directly.
 
 ---
 
@@ -194,8 +183,6 @@ Main endpoint:
 https://snippet-manager-tan.vercel.app/api/snippets
 ```
 
----
-
 ## GET all snippets
 
 ```http
@@ -217,8 +204,6 @@ Example:
 ]
 ```
 
----
-
 ## GET one snippet
 
 ```http
@@ -231,8 +216,6 @@ Example:
 GET /api/snippets/1
 ```
 
----
-
 ## Search snippets
 
 ```http
@@ -244,8 +227,6 @@ Example:
 ```text
 GET /api/snippets?search=binary
 ```
-
----
 
 ## Add a snippet
 
@@ -262,8 +243,6 @@ Example:
     "code": "def binary_search(arr, target): ..."
 }
 ```
-
----
 
 ## Delete a snippet
 
@@ -297,15 +276,6 @@ snippets
 ├── name
 ├── cat
 └── code
-```
-
-Example:
-
-```text
-sno  → 1
-name → binary search
-cat  → algorithms
-code → ...
 ```
 
 ---
@@ -352,17 +322,7 @@ It provides:
 * Search Snippets
 * Insert Snippet
 
-The extension communicates with the deployed REST API:
-
-```text
-VS Code Extension
-       ↓
-REST API
-       ↓
-Flask
-       ↓
-Supabase PostgreSQL
-```
+The extension communicates with the deployed REST API rather than accessing the database directly.
 
 For complete extension documentation, development instructions, testing, and VSIX packaging, see:
 
@@ -390,7 +350,7 @@ DATABASE_URL=your_database_connection_string
 
 The `.env` file is ignored by Git.
 
-The production database connection is configured through Vercel environment variables.
+Production database credentials are configured through Vercel environment variables.
 
 ### Important
 
@@ -472,11 +432,13 @@ The extension is packaged as a:
 
 file and can be installed manually in VS Code.
 
-Detailed extension instructions are available in:
+See:
 
 ```text
 vscode_extension/README.md
 ```
+
+for extension-specific instructions.
 
 ---
 
@@ -598,10 +560,8 @@ Possible future improvements:
 * Syntax highlighting
 * Better search
 * Language-specific snippets
-* Snippet categories
 * Cloud synchronization
 * VS Code Marketplace publishing
-* Extension settings
 * API authentication
 
 ---
@@ -649,5 +609,3 @@ VS Code Extension
 +
 Cloud Deployment
 ```
-
-````
