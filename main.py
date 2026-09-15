@@ -1,28 +1,31 @@
 from flask import Flask, render_template, request, redirect, jsonify
-import sqlite3
+import psycopg2
+import os
 
 app = Flask(__name__)
 
+def get_db_connection():
+    return psycopg2.connect(os.environ["DATABASE_URL"])
 
 @app.route("/")
 def home():
     category = request.args.get("category")
     search = request.args.get("search")
 
-    conn = sqlite3.connect("snippets.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     if search:
         cursor.execute(
             """
             SELECT * FROM snippets
-            WHERE name LIKE ? OR code LIKE ?
+            WHERE name ILIKE %s OR code ILIKE %s
             """,
             (f"%{search}%", f"%{search}%")
         )
     elif category:
         cursor.execute(
-            "SELECT * FROM snippets WHERE cat = ?",
+            "SELECT * FROM snippets WHERE cat = %s",
             (category,)
         )
     else:
@@ -48,11 +51,11 @@ def add():
     cat = request.form["cat"]
     code = request.form["code"]
 
-    conn = sqlite3.connect("snippets.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute(
-        "INSERT INTO snippets (name, cat, code) VALUES (?, ?, ?)",
+        "INSERT INTO snippets (name, cat, code) VALUES (%s, %s, %s)",
         (name, cat, code)
     )
 
@@ -64,11 +67,11 @@ def add():
 
 @app.route("/delete/<int:sno>", methods=["POST"])
 def delete(sno):
-    conn = sqlite3.connect("snippets.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute(
-        "DELETE FROM snippets WHERE sno = ?",
+        "DELETE FROM snippets WHERE sno = %s",
         (sno,)
     )
 
@@ -86,14 +89,14 @@ def delete(sno):
 def get_snippets():
     search = request.args.get("search")
 
-    conn = sqlite3.connect("snippets.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     if search:
         cursor.execute(
             """
             SELECT * FROM snippets
-            WHERE name LIKE ? OR code LIKE ?
+            WHERE name ILIKE %s OR code ILIKE %s
             """,
             (f"%{search}%", f"%{search}%")
         )
@@ -120,11 +123,11 @@ def get_snippets():
 # V5.2 - Get one snippet
 @app.route("/api/snippets/<int:sno>", methods=["GET"])
 def get_snippet(sno):
-    conn = sqlite3.connect("snippets.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT * FROM snippets WHERE sno = ?",
+        "SELECT * FROM snippets WHERE sno = %s",
         (sno,)
     )
 
@@ -174,11 +177,11 @@ def add_snippet():
             "error": "name, cat and code cannot be empty"
         }), 400
 
-    conn = sqlite3.connect("snippets.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT * FROM snippets WHERE name = ?",
+        "SELECT * FROM snippets WHERE name = %s",
         (name,)
     )
 
@@ -189,14 +192,17 @@ def add_snippet():
         }), 409
 
     cursor.execute(
-        "INSERT INTO snippets (name, cat, code) VALUES (?, ?, ?)",
+        """
+        INSERT INTO snippets (name, cat, code)
+        VALUES (%s, %s, %s)
+        RETURNING sno
+        """,
         (name, cat, code)
     )
 
+    sno = cursor.fetchone()[0]
+
     conn.commit()
-
-    sno = cursor.lastrowid
-
     conn.close()
 
     return jsonify({
@@ -211,11 +217,11 @@ def add_snippet():
 # V5.4 - Delete snippet
 @app.route("/api/snippets/<int:sno>", methods=["DELETE"])
 def delete_snippet(sno):
-    conn = sqlite3.connect("snippets.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT * FROM snippets WHERE sno = ?",
+        "SELECT * FROM snippets WHERE sno = %s",
         (sno,)
     )
 
@@ -226,7 +232,7 @@ def delete_snippet(sno):
         }), 404
 
     cursor.execute(
-        "DELETE FROM snippets WHERE sno = ?",
+        "DELETE FROM snippets WHERE sno = %s",
         (sno,)
     )
 
