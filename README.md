@@ -1,3 +1,4 @@
+````markdown
 # Code Snippet Manager
 
 A full-stack code snippet management application built with Flask, PostgreSQL, REST APIs, and a VS Code extension.
@@ -29,11 +30,11 @@ The project started as a simple Python snippet manager and gradually evolved int
 
 ### VS Code Extension
 
-- Show all snippets inside VS Code
+- Show saved snippets inside VS Code
 - Search snippets
 - Insert snippets directly into the active editor
 - Uses the deployed REST API
-- Does not require the Flask server to run locally
+- Works without running the Flask server locally
 
 ---
 
@@ -72,20 +73,17 @@ The current production architecture is:
 ### Production flow
 
 ```text
-VS Code Extension
-       ↓
-HTTPS Request
-       ↓
-Vercel
-       ↓
-Flask REST API
-       ↓
-Supabase PostgreSQL
-       ↓
-JSON Response
-       ↓
-VS Code Extension
+Web Browser ────────→ Vercel
+                         ↓
+                    Flask REST API
+                         ↓
+                  Supabase PostgreSQL
+                         ↑
+                         │
+VS Code Extension ───────┘
 ```
+
+The VS Code extension communicates with the REST API and does not access the database directly.
 
 ---
 
@@ -98,16 +96,16 @@ VS Code Extension
 * psycopg2
 * REST API
 
-## Database
-
-* PostgreSQL
-* Supabase
-
 ## Frontend
 
 * HTML
 * CSS
-* Jinja templates
+* Jinja Templates
+
+## Database
+
+* PostgreSQL
+* Supabase
 
 ## VS Code Extension
 
@@ -142,10 +140,8 @@ snippet_manager/
 │   └── HTML / Jinja templates
 │
 ├── vscode_extension/
-│   │
 │   ├── src/
 │   │   └── extension.ts
-│   │
 │   ├── package.json
 │   ├── package-lock.json
 │   ├── tsconfig.json
@@ -171,7 +167,7 @@ The Flask application is contained in:
 main.py
 ```
 
-Flask handles:
+It handles:
 
 * Web pages
 * REST API routes
@@ -181,7 +177,7 @@ Flask handles:
 * Deleting snippets
 * Returning JSON responses
 
-The Flask application is deployed on Vercel.
+The backend is deployed on Vercel.
 
 ---
 
@@ -230,8 +226,6 @@ Example:
 GET /api/snippets/<id>
 ```
 
-Returns a single snippet.
-
 Example:
 
 ```text
@@ -260,7 +254,7 @@ GET /api/snippets?search=binary
 POST /api/snippets
 ```
 
-Example JSON:
+Example:
 
 ```json
 {
@@ -294,7 +288,7 @@ The production application uses:
 Supabase PostgreSQL
 ```
 
-The database contains the snippet data used by both the web application and VS Code extension.
+The database stores the snippets used by the web application and VS Code extension.
 
 Conceptually:
 
@@ -317,9 +311,71 @@ code → ...
 
 ---
 
+# 🔄 Database Migration
+
+The project originally used SQLite during development.
+
+The migration script:
+
+```text
+migrate.py
+```
+
+was used to move the existing data into Supabase PostgreSQL.
+
+Migration flow:
+
+```text
+SQLite
+  ↓
+migrate.py
+  ↓
+Supabase PostgreSQL
+```
+
+The migration was completed and the migrated data was verified through the application and API.
+
+SQLite is no longer used as the production database.
+
+---
+
+# 💻 VS Code Extension
+
+The VS Code extension is located in:
+
+```text
+vscode_extension/
+```
+
+It provides:
+
+* Show Snippets
+* Search Snippets
+* Insert Snippet
+
+The extension communicates with the deployed REST API:
+
+```text
+VS Code Extension
+       ↓
+REST API
+       ↓
+Flask
+       ↓
+Supabase PostgreSQL
+```
+
+For complete extension documentation, development instructions, testing, and VSIX packaging, see:
+
+```text
+vscode_extension/README.md
+```
+
+---
+
 # 🔐 Environment Variables
 
-Database credentials are never stored directly in the source code.
+Database credentials are stored using environment variables.
 
 Local development uses:
 
@@ -335,7 +391,7 @@ DATABASE_URL=your_database_connection_string
 
 The `.env` file is ignored by Git.
 
-The production `DATABASE_URL` is configured directly inside Vercel's environment variables.
+The production database connection is configured through Vercel environment variables.
 
 ### Important
 
@@ -349,287 +405,85 @@ to GitHub.
 
 ---
 
-# 🔄 Database Migration
+# 🔒 Ignored Local Files
 
-The project originally used SQLite during development.
-
-The migration script is:
+The following files are intentionally ignored:
 
 ```text
-migrate.py
+.env
+snippets.db
+snippets.json
+__pycache__/
+*.pyc
 ```
 
-It was used to move the existing SQLite snippet data into Supabase PostgreSQL.
-
-The migration process was:
-
-```text
-SQLite
-  ↓
-migrate.py
-  ↓
-Supabase PostgreSQL
-```
-
-The migration was completed and the migrated data was verified through the application and API.
+The SQLite and JSON files are local development/backup files and are not used by the production application.
 
 ---
 
-# 💻 VS Code Extension
+# 🧪 API Testing
 
-The VS Code extension is located in:
+The REST API was tested using Postman.
 
-```text
-vscode_extension/
-```
-
-Its main source file is:
+Tested operations:
 
 ```text
-vscode_extension/src/extension.ts
+GET all snippets       ✅
+GET one snippet        ✅
+Search snippets        ✅
+POST snippet           ✅
+DELETE snippet         ✅
 ```
 
-The extension communicates with the production REST API.
-
-It does not directly access the PostgreSQL database.
-
-Instead:
-
-```text
-VS Code Extension
-       ↓
-REST API
-       ↓
-Flask
-       ↓
-Supabase PostgreSQL
-```
+The production API was also tested after deployment.
 
 ---
 
-# VS Code Commands
+# 🚀 Deployment
 
-Open the VS Code Command Palette:
+## Backend
 
-```text
-Ctrl + Shift + P
-```
-
-Available commands:
+The Flask application is deployed using:
 
 ```text
-Code Snippet Manager: Show Snippets
-
-Code Snippet Manager: Search Snippets
-
-Code Snippet Manager: Insert Snippet
+Vercel
 ```
 
----
-
-## Show Snippets
-
-Retrieves snippets through:
-
-```http
-GET /api/snippets
-```
-
-The snippets are displayed using VS Code's Quick Pick interface.
-
----
-
-## Search Snippets
-
-The user enters a search query.
-
-The extension sends:
-
-```http
-GET /api/snippets?search=<query>
-```
-
-The matching snippets are displayed inside VS Code.
-
----
-
-## Insert Snippet
-
-The extension retrieves the snippets and displays them in a Quick Pick menu.
-
-After selecting a snippet, its code is inserted at the current cursor position in the active VS Code editor.
-
----
-
-# 🧪 Testing the Extension
-
-The extension can be tested using the VS Code Extension Development Host.
-
-Open:
-
-```text
-vscode_extension/
-```
-
-Then install dependencies:
-
-```bash
-npm install
-```
-
-Compile:
-
-```bash
-npm run compile
-```
-
-Press:
-
-```text
-F5
-```
-
-This opens:
-
-```text
-Extension Development Host
-```
-
-Test:
-
-```text
-Code Snippet Manager: Show Snippets
-Code Snippet Manager: Search Snippets
-Code Snippet Manager: Insert Snippet
-```
-
-The extension can be tested without running the local Flask server because it communicates with the deployed API.
-
----
-
-# 📦 Packaging the VS Code Extension
-
-From:
-
-```text
-vscode_extension/
-```
-
-Compile:
-
-```bash
-npm run compile
-```
-
-Package:
-
-```bash
-npm run package
-```
-
-This creates a VSIX package similar to:
-
-```text
-code-snippet-manager-0.0.1.vsix
-```
-
-The VSIX can be installed manually through:
-
-```text
-Ctrl + Shift + P
-```
-
-then:
-
-```text
-Extensions: Install from VSIX...
-```
-
----
-
-# 📦 What is a VSIX?
-
-A `.vsix` file is the packaged version of a VS Code extension.
-
-It contains the files required to install and run the extension.
-
-Conceptually:
-
-```text
-TypeScript source
-       ↓
-npm run compile
-       ↓
-JavaScript output
-       ↓
-vsce package
-       ↓
-.vsix
-       ↓
-Install into VS Code
-```
-
-It is similar in concept to a packaged installer for an application, but specifically for VS Code extensions.
-
----
-
-# 🌍 Production vs Local Development
-
-## Earlier development setup
-
-The extension originally communicated with:
-
-```text
-http://127.0.0.1:5000
-```
-
-which required the Flask server to be running locally.
-
-The architecture was:
-
-```text
-VS Code
-   ↓
-Local Flask
-   ↓
-SQLite
-```
-
----
-
-## Current production setup
-
-The extension now communicates with:
+Production domain:
 
 ```text
 https://snippet-manager-tan.vercel.app
 ```
 
-The architecture is:
+## Database
+
+The production database is hosted using:
 
 ```text
-VS Code
-   ↓ HTTPS
-Vercel
-   ↓
-Flask REST API
-   ↓
 Supabase PostgreSQL
 ```
 
-Therefore, the production VS Code extension does not require:
+## VS Code Extension
 
-```bash
-python main.py
+The extension is packaged as a:
+
+```text
+.vsix
 ```
 
-to be running on the user's computer.
+file and can be installed manually in VS Code.
+
+Detailed extension instructions are available in:
+
+```text
+vscode_extension/README.md
+```
 
 ---
 
 # 🔄 Project Evolution
 
-This project was built incrementally.
+This project was built incrementally:
 
 ```text
 V1
@@ -659,22 +513,15 @@ Vercel Deployment
 Production VS Code Extension
 ```
 
-Each stage introduced a new concept while keeping the existing project functional.
+Each stage introduced a new concept while keeping the project functional.
 
 ---
 
 # 🧠 Why the Architecture Changed
 
-The project originally used local SQLite storage.
+The project originally used local SQLite storage because it was simple, lightweight, and easy to use during development.
 
-SQLite was useful during development because it is:
-
-* Simple
-* Lightweight
-* File-based
-* Easy to use with Flask
-
-However, the production application needed a remotely accessible database.
+For production, the application needed a remotely accessible database so that the website and VS Code extension could access the same data from anywhere.
 
 The database was therefore migrated from:
 
@@ -688,182 +535,22 @@ to:
 Supabase PostgreSQL
 ```
 
-The Flask API was then deployed to:
+The Flask REST API was then deployed to:
 
 ```text
 Vercel
 ```
 
-This allowed the VS Code extension to access the application from anywhere through HTTPS.
-
----
-
-# 🔒 Files That Should Not Be Committed
-
-The following files are intentionally ignored:
+This created the current cloud architecture:
 
 ```text
-.env
-snippets.db
-snippets.json
-__pycache__/
-*.pyc
-```
-
-The `.env` file contains sensitive database credentials.
-
-The SQLite and JSON files are local development/backup files and are no longer used as the production database.
-
----
-
-# 🔧 Git Workflow
-
-The project is developed incrementally using Git.
-
-The general workflow is:
-
-```bash
-git status
-```
-
-Review changes.
-
-Stage specific files:
-
-```bash
-git add <file>
-```
-
-Commit:
-
-```bash
-git commit -m "description of changes"
-```
-
-Push:
-
-```bash
-git push
-```
-
-The project uses commits to track blocks of small-to-major changes rather than making one huge commit at the end.
-
----
-
-# 🧪 API Testing
-
-The REST API was tested using Postman.
-
-Tested operations include:
-
-```text
-GET all snippets       ✅
-GET one snippet        ✅
-Search snippets        ✅
-POST snippet           ✅
-DELETE snippet         ✅
-```
-
-The production API was also tested after deployment to Vercel.
-
----
-
-# 🚀 Deployment
-
-## Backend
-
-The Flask application is deployed using:
-
-```text
+Client
+  ↓
 Vercel
-```
-
-Production domain:
-
-```text
-https://snippet-manager-tan.vercel.app
-```
-
-## Database
-
-The production database is hosted using:
-
-```text
+  ↓
+Flask REST API
+  ↓
 Supabase PostgreSQL
-```
-
-## Extension
-
-The VS Code extension is packaged as:
-
-```text
-.vsix
-```
-
-and can be installed manually in VS Code.
-
----
-
-# 🛠️ Local Development
-
-## Backend
-
-Install Python dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-Make sure `.env` contains:
-
-```env
-DATABASE_URL=your_database_connection_string
-```
-
-Run Flask locally:
-
-```bash
-python main.py
-```
-
-The local application normally runs at:
-
-```text
-http://127.0.0.1:5000
-```
-
----
-
-## Extension
-
-Move into the extension directory:
-
-```bash
-cd vscode_extension
-```
-
-Install dependencies:
-
-```bash
-npm install
-```
-
-Compile:
-
-```bash
-npm run compile
-```
-
-Run the Extension Development Host:
-
-```text
-F5
-```
-
-Package:
-
-```bash
-npm run package
 ```
 
 ---
@@ -924,8 +611,6 @@ Possible future improvements:
 
 The long-term goal of Code Snippet Manager is to provide a convenient way to store and access reusable code snippets across projects.
 
-The VS Code extension brings the snippets directly into the developer's workflow so that frequently used code can be searched and inserted without leaving the editor.
-
 The project also serves as a practical learning project covering:
 
 ```text
@@ -952,7 +637,7 @@ Cloud Deployment
 
 **Code Snippet Manager**
 
-A personal full-stack learning and portfolio project that evolved from a simple Python program into a cloud-connected application with:
+A full-stack learning and portfolio project that evolved from a simple Python program into a cloud-connected application with:
 
 ```text
 Web Application
@@ -965,3 +650,5 @@ VS Code Extension
 +
 Cloud Deployment
 ```
+
+````
