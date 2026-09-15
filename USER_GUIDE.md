@@ -990,7 +990,7 @@ Use:
 USER_GUIDE.md
 ````
 
-Your repository would then look clean:
+More documentation:
 
 ```text
 snippet_manager/
