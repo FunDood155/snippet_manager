@@ -978,17 +978,6 @@ The cloud/API/database side happens behind the scenes.
 
 You can focus on learning and coding instead of worrying about how the application stores and retrieves the snippets.
 
-````
-
-### One thing I'd definitely change from your original
-
-I would **not call it `README2.md`**.
-
-Use:
-
-```text
-USER_GUIDE.md
-````
 
 More documentation:
 
