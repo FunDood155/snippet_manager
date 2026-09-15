@@ -8,7 +8,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 			try {
 				const response = await fetch(
-					'http://127.0.0.1:5000/api/snippets'
+					'https://snippet-manager-tan.vercel.app/api/snippets'
 				);
 
 				const data = await response.json() as any[];
@@ -53,7 +53,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 			try {
 				const response = await fetch(
-					`http://127.0.0.1:5000/api/snippets?search=${encodeURIComponent(search)}`
+					`https://snippet-manager-tan.vercel.app/api/snippets?search=${encodeURIComponent(search)}`
 				);
 
 				const data = await response.json() as any[];
@@ -83,62 +83,63 @@ export function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(searchDisposable);
 
+
 	const insertDisposable = vscode.commands.registerCommand(
-    'code-snippet-manager.insertSnippet',
-    async () => {
+		'code-snippet-manager.insertSnippet',
+		async () => {
 
-        try {
-            const response = await fetch(
-                'http://127.0.0.1:5000/api/snippets'
-            );
+			try {
+				const response = await fetch(
+					'https://snippet-manager-tan.vercel.app/api/snippets'
+				);
 
-            const data = await response.json() as any[];
+				const data = await response.json() as any[];
 
-            const snippets = data.map(snippet => ({
-                label: snippet.name,
-                description: snippet.cat,
-                detail: snippet.code,
-                code: snippet.code
-            }));
+				const snippets = data.map(snippet => ({
+					label: snippet.name,
+					description: snippet.cat,
+					detail: snippet.code,
+					code: snippet.code
+				}));
 
-            const selected = await vscode.window.showQuickPick(
-                snippets,
-                {
-                    placeHolder: 'Select a snippet to insert...'
-                }
-            );
+				const selected = await vscode.window.showQuickPick(
+					snippets,
+					{
+						placeHolder: 'Select a snippet to insert...'
+					}
+				);
 
-            if (!selected) {
-                return;
-            }
+				if (!selected) {
+					return;
+				}
 
-            const editor = vscode.window.activeTextEditor;
+				const editor = vscode.window.activeTextEditor;
 
-            if (!editor) {
-                vscode.window.showErrorMessage(
-                    'No active editor found'
-                );
-                return;
-            }
+				if (!editor) {
+					vscode.window.showErrorMessage(
+						'No active editor found'
+					);
+					return;
+				}
 
-            editor.edit(editBuilder => {
-                editBuilder.insert(
-                    editor.selection.active,
-                    selected.code
-                );
-            });
+				editor.edit(editBuilder => {
+					editBuilder.insert(
+						editor.selection.active,
+						selected.code
+					);
+				});
 
-        } catch (error) {
-            console.error(error);
+			} catch (error) {
+				console.error(error);
 
-            vscode.window.showErrorMessage(
-                'Could not connect to Flask API'
-            );
-        }
-    }
-);
+				vscode.window.showErrorMessage(
+					'Could not connect to Flask API'
+				);
+			}
+		}
+	);
 
-context.subscriptions.push(insertDisposable);
+	context.subscriptions.push(insertDisposable);
 }
 
 export function deactivate() {}
