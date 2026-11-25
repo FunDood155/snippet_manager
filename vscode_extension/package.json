@@ -10,7 +10,10 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished",
+    "onUri"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -25,24 +28,40 @@
       {
         "command": "code-snippet-manager.insertSnippet",
         "title": "Code Snippet Manager: Insert Snippet"
+      },
+      {
+        "command": "code-snippet-manager.signIn",
+        "title": "Code Snippet Manager: Sign In"
+      },
+      {
+        "command": "code-snippet-manager.signOut",
+        "title": "Code Snippet Manager: Sign Out"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Code Snippet Manager",
+      "properties": {
+        "snippetManager.serverUrl": {
+          "type": "string",
+          "default": "https://snippet-manager-tan.vercel.app",
+          "scope": "application",
+          "description": "Origin of the Code Snippet Manager server. Use HTTPS, or HTTP on loopback for local development."
+        }
+      }
+    }
   },
-"scripts": {
+  "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "vscode-test",
+    "test": "node --test test/*.test.cjs",
     "package": "vsce package"
-},
+  },
   "devDependencies": {
-    "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
     "@types/vscode": "^1.137.0",
-    "@vscode/test-cli": "^0.0.15",
-    "@vscode/test-electron": "^3.0.0",
     "@vscode/vsce": "^3.9.2",
     "eslint": "^10.5.0",
     "typescript": "^6.0.3",
@@ -51,5 +70,8 @@
   "overrides": {
     "diff": "^8.0.4",
     "serialize-javascript": "^7.0.6"
-  }
+  },
+  "extensionKind": [
+    "ui"
+  ]
 }

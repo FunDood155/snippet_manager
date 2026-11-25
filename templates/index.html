@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 
 <head>
     <title>Code Snippet Manager</title>
@@ -12,6 +12,15 @@
     <div class="container">
 
         <h1>Code Snippet Manager</h1>
+        <form action="{{ url_for('auth.logout') }}" method="POST">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit">Sign out</button>
+        </form>
+
+        <form action="{{ url_for('auth.revoke_vscode_grant') }}" method="POST">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit">Revoke all VS Code sessions</button>
+        </form>
 
         <!-- Add Snippet -->
 
@@ -20,6 +29,7 @@
             <h2>Add New Snippet</h2>
 
             <form action="/add" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                 <input
                     type="text"
@@ -116,6 +126,7 @@
                 <pre>{{ snippet[3] }}</pre>
 
                 <form action="/delete/{{ snippet[0] }}" method="POST">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                     <button class="delete" type="submit">
                         Delete

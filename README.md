@@ -1,5 +1,7 @@
 # Code Snippet Manager
 
+> For the WP-01 authenticated branch, see [authentication setup and migration](docs/authentication.md).
+
 A full-stack code snippet management application built with Flask, PostgreSQL, REST APIs, and a VS Code extension.
 
 The project started as a simple Python snippet manager and gradually evolved into a cloud-connected application with a web interface, REST API, PostgreSQL database, and VS Code integration.

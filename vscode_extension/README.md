@@ -1,5 +1,19 @@
 # Code Snippet Manager — VS Code Extension
 
+## Signing in on the authenticated branch
+
+In VS Code Desktop, run **Code Snippet Manager: Sign In**. Sign in to your
+Snippet Manager account in the browser, allow access, and choose **Open VS Code**
+or **Open VS Code Insiders**. Run **Show Snippets**, **Search Snippets**, or
+**Insert Snippet** from the Command Palette. The status bar shows whether this
+extension is signed in. Use **Code Snippet Manager: Sign Out** to disconnect.
+
+For a local VSIX, set the user setting `snippetManager.serverUrl` to the origin
+of the authenticated Flask server before signing in. The release and API examples
+below describe earlier versions. WP-01 server setup, migration and verification
+are in the repository's `docs/authentication.md`.
+
+
 A VS Code extension that lets you access, search, and insert your saved Code Snippet Manager snippets directly inside Visual Studio Code.
 
 The extension communicates with the deployed Code Snippet Manager REST API instead of accessing the database directly.

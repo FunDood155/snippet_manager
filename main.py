@@ -1,248 +1,200 @@
-from flask import Flask, render_template, request, redirect, jsonify
-import psycopg2
+import logging
 import os
+from datetime import timedelta
+from urllib.parse import urlsplit
 
-app = Flask(__name__)
+import psycopg2
+from dotenv import load_dotenv
+from flask import Flask, abort, g, jsonify, redirect, render_template, request, url_for
 
-def get_db_connection():
-    return psycopg2.connect(os.environ["DATABASE_URL"])
+import auth
+import store
 
-@app.route("/")
-def home():
-    category = request.args.get("category")
-    search = request.args.get("search")
+load_dotenv()
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
 
-    if search:
-        cursor.execute(
-            """
-            SELECT * FROM snippets
-            WHERE name ILIKE %s OR code ILIKE %s
-            """,
-            (f"%{search}%", f"%{search}%")
+def valid_origin(value, allow_local_http):
+    try:
+        url = urlsplit(value)
+        return (
+            bool(url.hostname) and not url.username and not url.password
+            and not (url.path or url.query or url.fragment)
+            and (url.scheme == "https" or (
+                allow_local_http and url.scheme == "http" and url.hostname in ("localhost", "127.0.0.1", "::1")
+            ))
         )
-    elif category:
-        cursor.execute(
-            "SELECT * FROM snippets WHERE cat = %s",
-            (category,)
+    except ValueError:
+        return False
+
+
+def create_app(config=None):
+    app = Flask(__name__)
+    local_http = os.getenv("SNIPPET_LOCAL_HTTP") == "1" and not os.getenv("VERCEL")
+    app.config.update(
+        SECRET_KEY=os.getenv("SNIPPET_SESSION_KEY", ""),
+        SUPABASE_URL=os.getenv("SUPABASE_URL", "").rstrip("/"),
+        SUPABASE_PUBLISHABLE_KEY=os.getenv("SUPABASE_PUBLISHABLE_KEY", ""),
+        SNIPPET_SITE_URL=os.getenv("SNIPPET_SITE_URL", "").rstrip("/"),
+        SNIPPET_VSCODE_CLIENT_ID=os.getenv("SNIPPET_VSCODE_CLIENT_ID", ""),
+        SESSION_COOKIE_NAME="snippet_session_local" if local_http else "__Host-snippet_session",
+        SESSION_COOKIE_SECURE=not local_http,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_REFRESH_EACH_REQUEST=False,
+        PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+        MAX_CONTENT_LENGTH=1024 * 1024,
+    )
+    if config:
+        app.config.update(config)
+    app.register_blueprint(auth.bp)
+    app.jinja_env.globals["csrf_token"] = auth.csrf_token
+
+    @app.before_request
+    def authorize():
+        if request.endpoint == "static":
+            return
+        settings = app.config
+        if (len(app.secret_key) < 32 or not settings["SUPABASE_PUBLISHABLE_KEY"]
+                or not valid_origin(settings["SUPABASE_URL"], local_http)
+                or not valid_origin(settings["SNIPPET_SITE_URL"], local_http)):
+            abort(503, "Authentication is unavailable.")
+        if request.path.startswith("/api/"):
+            g.owner = auth.api_identity()
+        elif request.method == "POST":
+            auth.protect_form()
+        if request.endpoint in {"home", "add", "delete"}:
+            g.owner = auth.web_identity()
+            if not g.owner:
+                return redirect(url_for("auth.login"), code=303)
+
+    @app.after_request
+    def private_response(response):
+        if request.endpoint != "static":
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; style-src 'self'; form-action 'self'; "
+                "base-uri 'none'; frame-ancestors 'none'"
+            )
+        return response
+
+    @app.errorhandler(auth.AuthError)
+    def provider_error(error):
+        status = {400: 401, 401: 401, 403: 401, 404: 401, 422: 401, 429: 429}.get(error.status, 503)
+        return service_error(status)
+
+    @app.errorhandler(503)
+    @app.errorhandler(429)
+    def http_service_error(error):
+        return service_error(error.code)
+
+    @app.errorhandler(psycopg2.Error)
+    def database_error(_error):
+        return service_error(503)
+
+    def service_error(status):
+        message = {
+            401: "Authentication required",
+            429: "Too many attempts. Try again later.",
+            503: "The service is temporarily unavailable. Try again later.",
+        }[status]
+        if request.path.startswith("/api/"):
+            response = jsonify(error=message)
+            if status == 401:
+                response.headers["WWW-Authenticate"] = "Bearer"
+            return response, status
+        return render_template("service_error.html", message=message), status
+
+    @app.get("/")
+    def home():
+        snippets, categories = store.list_snippets(
+            g.owner, request.args.get("search"), request.args.get("category"), include_categories=True,
         )
-    else:
-        cursor.execute("SELECT * FROM snippets")
+        return render_template("index.html", snippets=snippets, categories=categories)
 
-    snippets = cursor.fetchall()
+    @app.post("/add")
+    def add():
+        fields, error = snippet_fields(request.form)
+        if error:
+            abort(400, error)
+        store.add_snippet(g.owner, *fields)
+        return redirect(url_for("home"), code=303)
 
-    cursor.execute("SELECT DISTINCT cat FROM snippets")
-    categories = cursor.fetchall()
+    @app.post("/delete/<int:sno>")
+    def delete(sno):
+        if not valid_id(sno) or not store.delete_snippet(g.owner, sno):
+            abort(404)
+        return redirect(url_for("home"), code=303)
 
-    conn.close()
+    @app.get("/api/snippets")
+    def get_snippets():
+        rows, _ = store.list_snippets(g.owner, request.args.get("search"), request.args.get("category"))
+        return jsonify([snippet_json(row) for row in rows])
 
-    return render_template(
-        "index.html",
-        snippets=snippets,
-        categories=categories
-    )
+    @app.get("/api/snippets/<int:sno>")
+    def get_snippet(sno):
+        row = store.get_snippet(g.owner, sno) if valid_id(sno) else None
+        if row is None:
+            return jsonify(error="Snippet not found"), 404
+        return jsonify(snippet_json(row))
 
+    @app.post("/api/snippets")
+    def add_snippet():
+        data = request.get_json(silent=True)
+        if not data or not isinstance(data, dict):
+            return jsonify(error="Request body is required"), 400
+        fields, error = snippet_fields(data)
+        if error:
+            return jsonify(error=error), 400
+        sno = store.add_snippet(g.owner, *fields, reject_duplicate=True)
+        if sno is None:
+            return jsonify(error="Snippet already exists"), 409
+        return jsonify(message="Snippet added", **snippet_json((sno, *fields))), 201
 
-@app.route("/add", methods=["POST"])
-def add():
-    name = request.form["name"]
-    cat = request.form["cat"]
-    code = request.form["code"]
+    @app.delete("/api/snippets/<int:sno>")
+    def delete_snippet(sno):
+        if not valid_id(sno) or not store.delete_snippet(g.owner, sno):
+            return jsonify(error="Snippet not found"), 404
+        return jsonify(message="Snippet deleted")
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    @app.get("/api/session")
+    def api_session():
+        return jsonify(signedIn=True)
 
-    cursor.execute(
-        "INSERT INTO snippets (name, cat, code) VALUES (%s, %s, %s)",
-        (name, cat, code)
-    )
+    @app.post("/api/logout")
+    def api_logout():
+        auth.revoke_vscode_session(g.owner, g.api_session_id)
+        return "", 204
 
-    conn.commit()
-    conn.close()
-
-    return redirect("/")
-
-
-@app.route("/delete/<int:sno>", methods=["POST"])
-def delete(sno):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "DELETE FROM snippets WHERE sno = %s",
-        (sno,)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return redirect("/")
-
-
-# ==================== V5 API ====================
-
-
-# V5.1 - Get all snippets
-@app.route("/api/snippets", methods=["GET"])
-def get_snippets():
-    search = request.args.get("search")
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    if search:
-        cursor.execute(
-            """
-            SELECT * FROM snippets
-            WHERE name ILIKE %s OR code ILIKE %s
-            """,
-            (f"%{search}%", f"%{search}%")
-        )
-    else:
-        cursor.execute("SELECT * FROM snippets")
-
-    snippets = cursor.fetchall()
-
-    conn.close()
-
-    result = []
-
-    for snippet in snippets:
-        result.append({
-            "sno": snippet[0],
-            "name": snippet[1],
-            "cat": snippet[2],
-            "code": snippet[3]
-        })
-
-    return jsonify(result)
+    return app
 
 
-# V5.2 - Get one snippet
-@app.route("/api/snippets/<int:sno>", methods=["GET"])
-def get_snippet(sno):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT * FROM snippets WHERE sno = %s",
-        (sno,)
-    )
-
-    snippet = cursor.fetchone()
-
-    conn.close()
-
-    if snippet is None:
-        return jsonify({"error": "Snippet not found"}), 404
-
-    result = {
-        "sno": snippet[0],
-        "name": snippet[1],
-        "cat": snippet[2],
-        "code": snippet[3]
-    }
-
-    return jsonify(result)
+def valid_id(sno):
+    return 0 <= sno <= 2147483647
 
 
-# V5.3 + V5.6 - Add snippet with validation
-@app.route("/api/snippets", methods=["POST"])
-def add_snippet():
-    data = request.get_json()
-
-    if not data:
-        return jsonify({
-            "error": "Request body is required"
-        }), 400
-
-    if "name" not in data or "cat" not in data or "code" not in data:
-        return jsonify({
-            "error": "name, cat and code are required"
-        }), 400
-
-    name = data["name"]
-    cat = data["cat"]
-    code = data["code"]
-
-    if not isinstance(name, str) or not isinstance(cat, str) or not isinstance(code, str):
-        return jsonify({
-            "error": "name, cat and code must be strings"
-        }), 400
-
-    if not name.strip() or not cat.strip() or not code.strip():
-        return jsonify({
-            "error": "name, cat and code cannot be empty"
-        }), 400
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT * FROM snippets WHERE name = %s",
-        (name,)
-    )
-
-    if cursor.fetchone():
-        conn.close()
-        return jsonify({
-            "error": "Snippet already exists"
-        }), 409
-
-    cursor.execute(
-        """
-        INSERT INTO snippets (name, cat, code)
-        VALUES (%s, %s, %s)
-        RETURNING sno
-        """,
-        (name, cat, code)
-    )
-
-    sno = cursor.fetchone()[0]
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        "message": "Snippet added",
-        "sno": sno,
-        "name": name,
-        "cat": cat,
-        "code": code
-    }), 201
+def snippet_json(row):
+    return dict(zip(("sno", "name", "cat", "code"), row))
 
 
-# V5.4 - Delete snippet
-@app.route("/api/snippets/<int:sno>", methods=["DELETE"])
-def delete_snippet(sno):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+def snippet_fields(data):
+    keys = ("name", "cat", "code")
+    if any(key not in data for key in keys):
+        return None, "name, cat and code are required"
+    fields = tuple(data[key] for key in keys)
+    if any(not isinstance(value, str) for value in fields):
+        return None, "name, cat and code must be strings"
+    if any(not value.strip() for value in fields):
+        return None, "name, cat and code cannot be empty"
+    if any("\x00" in value for value in fields):
+        return None, "name, cat and code cannot contain null characters"
+    return fields, None
 
-    cursor.execute(
-        "SELECT * FROM snippets WHERE sno = %s",
-        (sno,)
-    )
 
-    if cursor.fetchone() is None:
-        conn.close()
-        return jsonify({
-            "error": "Snippet not found"
-        }), 404
-
-    cursor.execute(
-        "DELETE FROM snippets WHERE sno = %s",
-        (sno,)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        "message": "Snippet deleted"
-    }), 200
-
+app = create_app()
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # OAuth callback query strings contain short-lived authorization codes.
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    app.run()
