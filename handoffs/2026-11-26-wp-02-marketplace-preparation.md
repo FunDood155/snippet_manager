@@ -1,0 +1,30 @@
+# Snippo — WP-02: Marketplace preparation
+
+Status: Ready for Work; explicit activation required.
+Repository: FunDood155/snippet_manager (retain existing name and visibility).
+Verified implementation baseline: feature/authentication @ 2466912aeef085472d528e5bf03fa6a77df12032 (improve oauth success page).
+Handoff branch: features/handoffs (documentation only).
+Implementation branch: continue feature/authentication, after verifying latest head and reconciling any drift. This avoids a new branch and preserves its Vercel Git deployment opt-out.
+Commit message: prepare snippo marketplace release
+
+## Objective
+Prepare a free, installable Snippo 1.0.0 VS Code release candidate for manual Marketplace upload. Publisher account already created by the user. Keep the working Flask/Supabase authentication and existing snippet functionality. Do not publish or deploy in this task.
+
+## Scope
+1. Update extension manifest, lockfile and user-facing extension branding: name snippo, displayName Snippo, publisher dineshkaarthik, publisher display name Dinesh Kaarthik, version 1.0.0, extension ID dineshkaarthik.snippo. Tagline: Your code. Always within reach. Add a concise accurate description, suitable categories/keywords, repository/issue links and homepage https://snippet-manager-tan.vercel.app. Retain compatible VS Code engine constraints unless a tested reason to change exists. Keep command IDs and settings keys where practical; rename visible command titles/status/notifications to Snippo. Do not rename the GitHub repo.
+2. Update every fixed extension identity reference in TypeScript, backend callback template, tests and docs. Both vscode://dineshkaarthik.snippo/auth and vscode-insiders://dineshkaarthik.snippo/auth must work with existing state, authorization code, S256 PKCE, callback validation and cancellation protections. Keep registered HTTPS callback URI, OAuth client ID, Supabase provider, server URL, token refresh and SecretStorage behavior unchanged. A new extension ID has separate secure storage; document that users install the new extension, disable/uninstall the old one and sign in once again. Do not migrate secrets between extensions. No arbitrary callback targets.
+3. Prepare extension-specific README and changelog for Marketplace, with accurate install/sign-in/show/search/insert/manage/sign-out instructions, requirements, known limitations and support links. Explain external service dependency, storage/transmission of emails and snippets, authentication token handling, privacy and account/data deletion arrangements accurately. Warn users not to store secrets in snippets. Do not invent privacy guarantees or deletion features. Inspect existing license and preserve it; if absent or unclear, report licensing as a release blocker for owner decision rather than choosing legal terms unilaterally. Verify current Marketplace packaging requirements using official VS Code documentation.
+4. Logo is optional: defer final branding. If the user provides the approved second blue hippo image, use its square mark as a temporary PNG icon (at least 128x128, preferably 256x256), not the full presentation; otherwise leave custom icon unset and report it as deferred. Primary brand accent #007ACC; no unrelated website redesign.
+5. Perform a focused read-only public-release readiness review: unverified email account impersonation/recovery risks (confirmation was disabled for private testing), direct Supabase signup abuse and quotas, session refresh/revocation, account isolation, dependency/runtime security, secrets and VSIX contents, and free-tier/public-hosting constraints. Verify public distribution terms and actual user data handling. Identify concrete blockers and propose minimal remedies; do not change live Auth settings, email verification, password policy, database, or architecture. Do not declare public-release readiness while material security/privacy/terms blockers remain.
+
+## Acceptance and verification
+- Exact manifest identity and version; consistent callback URI authority in both backend and desktop client; existing HTTPS redirect URI unchanged. Test new callback acceptance, rejected old/wrong authorities, mismatched state, expiry and denial; no weakening of PKCE or ownership checks.
+- Run backend regression tests using disposable local database and mocked provider (never live DB test admin URL), npm ci, npm test (compile/lint/tests), and npm run package. Inspect packaged manifest, file list, README and license if available. Check package excludes secrets, .env, test fixtures, unnecessary files and old compiled identity. Record npm audit results, distinguishing dev and runtime dependencies.
+- Provide exact build/install commands for the user and expected snippo-1.0.0.vsix filename. Do not commit VSIX binaries. If feasible return a tested package artifact separately.
+- Document manual integration sequence: deploy updated backend only after explicit authorization; install new VSIX and remove/disable old extension; fresh sign-in, own starter/custom snippets, search and insert, close/reopen VS Code, token renewal, second-account isolation, manual sign-out/revocation. Distinguish automated tests from unperformed real-device tests. No public upload until acceptance tests and release blockers are resolved.
+
+## Exclusions and operations
+GitHub: implement, test, commit and push only to feature/authentication. Retain Vercel branch deployment opt-out. Do not modify main, merge, open PR, rename repo, change repo settings or visibility, create tags/releases, publish to Marketplace, change Vercel or Supabase settings, deploy Preview/Production, or start performance/UI redesign. No destructive operations. No PAT or extra paid services required.
+
+## Report back
+Branch, commit SHA, files changed, manifest identity, callback compatibility, test counts and actual commands/results, VSIX filename and contents check, logo/license status, privacy/readiness findings and outstanding blockers, no deployment/database changes, manual test and release steps. Explicitly identify any missing access or unverified claims. Public release remains a separate decision.
