@@ -8,9 +8,8 @@
 </head>
 <body>
 <main class="container">
-    {% set titles = {"login": "Sign in", "register": "Create an account", "forgot": "Request a reset code",
-                     "confirm": "Confirm email", "reset": "Set a new password", "consent": "Connect VS Code",
-                     "resend": "Request a new confirmation code", "revoked": "VS Code access revoked"} %}
+    {% set titles = {"login": "Sign in", "register": "Create an account",
+                     "consent": "Connect VS Code", "revoked": "VS Code access revoked"} %}
     <h1>{{ titles[mode] }}</h1>
     <div class="card">
         {% if mode == "revoked" %}
@@ -18,11 +17,11 @@
         <p><a href="/">Return to your snippets</a></p>
         {% else %}
         {% if error %}<p role="alert">{{ error }}</p>{% endif %}
-        {% if notice %}<p role="status">{{ notice }}</p>{% endif %}
-        {% set endpoints = {"login": "login", "register": "register", "forgot": "forgot-password",
-                            "confirm": "confirm-email", "reset": "reset-password", "consent": "oauth/consent",
-                            "resend": "resend-confirmation"} %}
-        <form method="post" action="/{{ endpoints[mode] }}">
+        {% for message in get_flashed_messages(category_filter=["registration"]) %}
+        <p role="status">{{ message }}</p>
+        {% endfor %}
+        {% set endpoints = {"login": "auth.login", "register": "auth.register", "consent": "auth.consent"} %}
+        <form method="post" action="{{ url_for(endpoints[mode]) }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             {% if authorization_id %}
             <input type="hidden" name="authorization_id" value="{{ authorization_id }}">
@@ -35,25 +34,17 @@
             {% else %}
             <label for="email">Email address</label>
             <input id="email" type="email" name="email" required autocomplete="email" maxlength="254">
-            {% if mode in ("confirm", "reset") %}
-            <label for="code">Verification code</label>
-            <input id="code" name="code" required inputmode="numeric" autocomplete="one-time-code" maxlength="10">
-            {% endif %}
-            {% if mode in ("login", "register", "reset") %}
-            <label for="password">{{ "New password (at least 12 characters)" if mode != "login" else "Password" }}</label>
+            <label for="password">Password</label>
             <input id="password" type="password" name="password" required
                    autocomplete="{{ 'current-password' if mode == 'login' else 'new-password' }}">
-            {% endif %}
+            {% if mode == "register" %}<p>Choose a password for Snippet Manager.</p>{% endif %}
             <button type="submit">{{ titles[mode] }}</button>
             {% endif %}
         </form>
         {% if mode == "login" %}
-        <p><a href="/register">Create an account</a> · <a href="/confirm-email">Confirm email</a>
-           · <a href="/forgot-password">Forgot password?</a></p>
-        {% elif mode != "consent" %}
-        <p><a href="/login">Sign in</a>
-           {% if mode == "confirm" %} · <a href="/resend-confirmation">Request a new confirmation code</a>{% endif %}
-           {% if mode == "reset" %} · <a href="/forgot-password">Request a new reset code</a>{% endif %}</p>
+        <p><a href="{{ url_for('auth.register', authorization_id=authorization_id) }}">Create an account</a></p>
+        {% elif mode == "register" %}
+        <p><a href="{{ url_for('auth.login', authorization_id=authorization_id) }}">Sign in</a></p>
         {% endif %}
         {% endif %}
     </div>

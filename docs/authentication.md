@@ -6,8 +6,7 @@ with Supabase Auth. It talks to Flask for snippets and never connects to Postgre
 
 ## Architecture and limits
 
-- Supabase Auth handles password hashing, email verification codes, password
-  recovery and refresh tokens. Flask uses a rotating CSRF token and an opaque
+- Supabase Auth handles password hashing, signup validation and refresh tokens. Flask uses a rotating CSRF token and an opaque
   session handle in an HttpOnly, Secure, SameSite=Lax cookie. The session handle
   rotates on login. Supabase credentials stay in a private server-side PostgreSQL
   table, with a seven-day maximum web session and serialized refresh. Sign-out
@@ -31,8 +30,7 @@ with Supabase Auth. It talks to Flask for snippets and never connects to Postgre
   the Flask API, including when an access token is renewed. If offline, local
   sign-out still works and the extension reports that server revocation could
   not be confirmed. On the website, **Revoke all VS Code sessions** revokes
-  the Supabase grant and its refresh tokens across devices. A password reset
-  revokes web sessions and requests global provider logout. Provider JWTs may
+  the Supabase grant and its refresh tokens across devices. Provider JWTs may
   remain valid at services that only verify their signature until JWT expiry.
 - The database role has owner-scoped SQL queries and RLS, with no direct
   Data API access for `anon`, `authenticated` or `service_role`. The Flask
@@ -75,11 +73,12 @@ Official references: [password auth](https://supabase.com/docs/guides/auth/passw
    that dedicated runtime login, with TLS certificate verification for hosted
    PostgreSQL. The app checks that both PostgreSQL session and current roles
    are `snippet_app`. The old `DATABASE_URL` is unused.
-3. Enable email/password and **Confirm email**. Set the minimum password length
-   to at least 12 in Supabase. In **Confirm signup** and **Reset password**
-   templates, show the one-time code with `{{ .Token }}`. The application accepts
-   6 to 10 digits. Users enter the code on the same site where they requested it.
-   Configure code expiry and keep refresh-token rotation enabled.
+3. Enable email/password signup. For private testing, turn **Confirm email**
+   off in the Supabase dashboard. For a local CLI stack set
+   `auth.email.enable_confirmations` to `false` and restart the stack.
+   Registration sends users to sign-in, and Supabase enforces its configured
+   password policy. Keep refresh-token rotation enabled. The app does not
+   currently offer email confirmation or password recovery screens.
 4. Set the Supabase Auth Site URL to `SNIPPET_SITE_URL`. Enable the OAuth 2.1
    server, set the authorization path to `/oauth/consent`, and leave dynamic
    client registration off. Register a **public** client with no secret and one
@@ -95,13 +94,13 @@ Official references: [password auth](https://supabase.com/docs/guides/auth/passw
 ## Default starter snippets
 
 New accounts created after the starter migration receive four owned Python
-snippets as soon as their email is confirmed, or at signup if already confirmed.
+snippets at signup when Supabase automatically confirms the address.
 The database provisions them in the same transaction and records pending
 accounts in a private table until confirmation. Existing accounts receive no
 backfill. Deleting a starter is permanent unless the user creates it again.
 Starter snippets appear in the ordinary web library and VS Code commands.
 
-Test the signup and confirmation path against isolated Supabase before a hosted
+Test the signup and login path against isolated Supabase before a hosted
 cutover. If the starter migration needs to be reversed, apply
 `supabase/rollback_starter_snippets.sql` first, using the role that applied the
 starter migration. It removes provisioning and clears pending entries while
@@ -174,9 +173,10 @@ with `npm audit` and runtime dependency exposure with `npm audit --omit=dev`.
 For a manual test install the VSIX with **Extensions: Install from VSIX** in a
 clean desktop VS Code profile that satisfies the manifest's engine version.
 
-- Create two accounts and confirm both through the test mail inbox. Try an
-  expired code, a duplicate registration, an unconfirmed login and a password
-  reset. Verify the old session is invalidated.
+- Register and sign in with two test accounts. Verify each receives four starter
+  snippets. Register again using the same address and a different password,
+  then verify that the original password still works. Sign out and confirm
+  access to the snippet library requires signing in again.
 - Use separate browser sessions to add snippets and search by name, code and
   category. Confirm neither account sees the other's categories or snippets.
   Check create/read/delete using both bearer identities. Verify cross-account

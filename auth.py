@@ -10,7 +10,7 @@ from uuid import UUID
 
 import requests
 from flask import (
-    Blueprint, abort, current_app, g, jsonify, redirect, render_template, request, session, url_for,
+    Blueprint, abort, current_app, flash, g, jsonify, redirect, render_template, request, session, url_for,
 )
 
 import store
@@ -21,8 +21,9 @@ CALLBACK_PATH = "/oauth/vscode/callback"
 
 
 class AuthError(Exception):
-    def __init__(self, status):
+    def __init__(self, status, code=None):
         self.status = status
+        self.code = code
 
 
 def provider(method, path, *, token=None, body=None):
@@ -36,7 +37,15 @@ def provider(method, path, *, token=None, body=None):
             headers=headers, json=body, timeout=(3, 5), allow_redirects=False,
         )
         if not response.ok or response.is_redirect:
-            raise AuthError(response.status_code)
+            code = response.headers.get("x-sb-error-code")
+            if not code and response.content:
+                try:
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        code = payload.get("error_code") or payload.get("code")
+                except ValueError:
+                    pass
+            raise AuthError(response.status_code, code if isinstance(code, str) else None)
         return response.json() if response.content else {}
     except (requests.RequestException, ValueError):
         raise AuthError(503) from None
@@ -189,9 +198,9 @@ def revoke_vscode_grant():
     return render_template("auth.html", mode="revoked")
 
 
-def auth_page(mode, error=None, status=200, notice=None, authorization_id=None, account_email=None):
+def auth_page(mode, error=None, status=200, authorization_id=None, account_email=None):
     return render_template(
-        "auth.html", mode=mode, error=error, notice=notice, authorization_id=authorization_id,
+        "auth.html", mode=mode, error=error, authorization_id=authorization_id,
         account_email=account_email,
     ), status
 
@@ -221,7 +230,7 @@ def login():
         create_session(tokens)
     except AuthError as exc:
         if exc.status in (400, 401, 403, 422):
-            return auth_page("login", "Sign-in failed. Check your credentials and confirm your email.", 401,
+            return auth_page("login", "Sign-in failed. Check your email address and password.", 401,
                              authorization_id=authorization_id)
         raise
     if authorization_id:
@@ -233,77 +242,46 @@ def valid_email(email):
     return len(email) <= 254 and EMAIL.fullmatch(email)
 
 
-def password_valid(password):
-    return 12 <= len(password) <= 72 and len(password.encode()) <= 72
-
-
-@bp.route("/resend-confirmation", methods=["GET", "POST"])
 @bp.route("/register", methods=["GET", "POST"])
-@bp.route("/forgot-password", methods=["GET", "POST"])
-def request_email():
-    mode = {"/register": "register", "/forgot-password": "forgot",
-            "/resend-confirmation": "resend"}[request.path]
+def register():
+    authorization_id = pending_authorization()
     if request.method == "GET":
-        return auth_page(mode)
+        return auth_page("register", authorization_id=authorization_id)
+
     email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
     if not valid_email(email):
-        return auth_page(mode, "Enter a valid email address.", 400)
-    if mode == "register" and not password_valid(password):
-        return auth_page(mode, "Choose a password of at least 12 characters and at most 72 bytes.", 400)
-    limit(mode, email, 3, 40)
+        return auth_page("register", "Enter a valid email address.", 400, authorization_id=authorization_id)
+    if not password or len(password.encode()) > 72:
+        return auth_page("register", "Enter a password of up to 72 bytes.", 400, authorization_id=authorization_id)
+
+    limit("register", email, 3, 40)
     try:
-        if mode == "register":
-            provider("POST", "/signup", body={"email": email, "password": password})
-        elif mode == "resend":
-            provider("POST", "/resend", body={"email": email, "type": "signup"})
+        tokens = provider("POST", "/signup", body={"email": email, "password": password})
+    except AuthError as exc:
+        # Return the same public response for a new address and a duplicate address.
+        if exc.code in ("user_already_exists", "email_exists"):
+            tokens = {}
+        elif exc.code == "weak_password":
+            return auth_page("register", "Choose a longer or stronger password.", 400,
+                             authorization_id=authorization_id)
+        elif exc.code == "email_address_invalid":
+            return auth_page("register", "Enter a valid email address.", 400, authorization_id=authorization_id)
+        elif exc.status in (400, 422):
+            return auth_page("register", "Check your email address and password and try again.", 400,
+                             authorization_id=authorization_id)
         else:
-            provider("POST", "/recover", body={"email": email})
-    except AuthError as exc:
-        if exc.status not in (400, 401, 403, 404, 422, 429):
             raise
-    next_form = "reset" if mode == "forgot" else "confirm"
-    return auth_page(next_form, notice="If eligible, this address will receive a verification code.")
 
-
-@bp.route("/confirm-email", methods=["GET", "POST"])
-@bp.route("/reset-password", methods=["GET", "POST"])
-def verify_email():
-    mode = "confirm" if request.path == "/confirm-email" else "reset"
-    if request.method == "GET":
-        return auth_page(mode)
-    email = request.form.get("email", "").strip().lower()
-    otp = request.form.get("code", "").strip()
-    password = request.form.get("password", "")
-    if not valid_email(email) or not re.fullmatch(r"[0-9]{6,10}", otp):
-        return auth_page(mode, "Enter your email and verification code.", 400)
-    if mode == "reset" and not password_valid(password):
-        return auth_page(mode, "Choose a password of at least 12 characters and at most 72 bytes.", 400)
-    limit(mode, email, 8, 100)
-    try:
-        tokens = provider("POST", "/verify", body={
-            "email": email, "token": otp, "type": "signup" if mode == "confirm" else "recovery",
-        })
-    except AuthError as exc:
-        if exc.status in (400, 401, 403, 404, 422):
-            return auth_page(mode, "This code is invalid or expired. Request a new code.", 400)
-        raise
-    token = tokens["access_token"]
-    if mode == "reset":
+    # Auto-confirmed signups can issue a session. Discard it and require explicit sign-in.
+    if tokens.get("access_token"):
         try:
-            provider("PUT", "/user", token=token, body={"password": password})
-        except AuthError as exc:
-            if exc.status in (400, 422):
-                return auth_page(mode, "Choose a different password and request a new code.", 400)
-            raise
-        with store.cursor() as cur:
-            cur.execute("DELETE FROM snippet_private.web_sessions WHERE user_id = %s",
-                        (confirmed_identity(tokens["user"]),))
-    provider("POST", "/logout?scope=" + ("global" if mode == "reset" else "local"), token=token)
-    if session.get("handle"):
-        end_web_session()
-    session.clear()
-    return auth_page("login", notice="Email confirmed. Sign in." if mode == "confirm" else "Password updated. Sign in.")
+            provider("POST", "/logout?scope=local", token=tokens["access_token"])
+        except AuthError:
+            current_app.logger.warning("Could not revoke an unused registration session")
+
+    flash("You can now try signing in with your email and password.", "registration")
+    return redirect(url_for("auth.login", authorization_id=authorization_id), code=303)
 
 
 def end_web_session():

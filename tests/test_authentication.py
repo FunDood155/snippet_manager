@@ -62,14 +62,15 @@ class MockProvider:
         self.oauth_tokens = {fake_jwt(A, SESSION_A): A, fake_jwt(B, SESSION_B): B}
         self.confirmed = {"a@sample.test": A, "b@sample.test": B}
         self.token_user = {}
-        self.valid_otp = True
+        self.passwords = {}
+        self.create_account = None
         self.invalid_redirect = False
 
     def __call__(self, method, path, *, token=None, body=None):
         self.calls.append((method, path, body))
         if path == "/token?grant_type=password":
             user = self.confirmed.get(body["email"])
-            if not user or body["password"] != PASSWORD:
+            if not user or body["password"] != self.passwords.get(body["email"], PASSWORD):
                 raise auth.AuthError(400)
             return self.tokens(user)
         if path == "/token?grant_type=refresh_token":
@@ -83,13 +84,16 @@ class MockProvider:
             if token not in self.token_user:
                 raise auth.AuthError(403)
             return {"id": self.token_user[token], "email_confirmed_at": "fixture"}
-        if path == "/verify":
-            if not self.valid_otp or body["token"] != "123456":
-                raise auth.AuthError(403)
-            self.valid_otp = False
-            return self.tokens(A)
-        if path == "/signup" and body["email"] in self.confirmed:
-            raise auth.AuthError(422)
+        if path == "/signup":
+            email, password = body["email"], body["password"]
+            if len(password) < 6:
+                raise auth.AuthError(422, "weak_password")
+            if email in self.confirmed:
+                raise auth.AuthError(422, "user_already_exists")
+            user = self.create_account(confirmed=True)
+            self.confirmed[email] = user
+            self.passwords[email] = password
+            return self.tokens(user)
         if path == "/oauth/authorizations/" + ATTEMPT:
             return {"client": {"id": CLIENT}, "redirect_uri": ORIGIN + auth.CALLBACK_PATH}
         if path == "/oauth/authorizations/" + ATTEMPT + "/consent":
@@ -174,6 +178,7 @@ class AppTest(unittest.TestCase):
             "SNIPPET_SITE_URL": ORIGIN, "SNIPPET_VSCODE_CLIENT_ID": CLIENT,
             "SESSION_COOKIE_NAME": "__Host-snippet_session", "SESSION_COOKIE_SECURE": True,
         })
+        auth.provider.create_account = self.create_account
         self.browser = self.app.test_client()
         self.api_a = bearer(fake_jwt(A, SESSION_A))
         self.api_b = bearer(fake_jwt(B, SESSION_B))
@@ -189,17 +194,36 @@ class AppTest(unittest.TestCase):
             "name": "shared name", "cat": "sample", "code": "test code", **overrides,
         })
 
-    def test_registration_generic_duplicate_and_single_use_confirmation(self):
+    def test_registration_redirects_to_login_and_provisions_starters_once(self):
+        email = "new@sample.test"
+        password = "testpass"
+        first = self.form("/register", email=email, password=password)
+        duplicate = self.form("/register", email=email.upper(), password="other-password")
+        self.assertEqual((first.status_code, first.location), (303, "/login"))
+        self.assertEqual((duplicate.status_code, duplicate.location), (303, "/login"))
+        self.assertEqual(first.data, duplicate.data)
+        self.assertIn(b"try signing in", self.browser.get("/login").data)
+        self.assertEqual(self.browser.get("/").location, "/login")
+        self.assertEqual(self.form("/login", email=email, password="other-password").status_code, 401)
+        self.assertEqual(self.form("/login", email=email, password=password).status_code, 303)
+        owner = auth.provider.confirmed[email]
+        snippets, _ = store.list_snippets(owner)
+        self.assertEqual({row[1]: row[2] for row in snippets}, STARTERS)
+        self.assertEqual(len(snippets), 4)
+        self.assertIn(b"Hello World", self.browser.get("/").data)
+        self.assertEqual(self.browser.post("/logout", data={"csrf_token": csrf(self.browser, "/")}).status_code, 303)
+        self.assertEqual(self.browser.get("/").location, "/login")
+
+    def test_registration_validation_and_private_testing_forms(self):
         self.assertEqual(self.form("/register", email="invalid", password=PASSWORD).status_code, 400)
-        first = self.form("/register", email="new@sample.test", password=PASSWORD)
-        duplicate = self.form("/register", email="a@sample.test", password=PASSWORD)
-        self.assertEqual(first.status_code, 200)
-        self.assertIn(b"If eligible", first.data)
-        self.assertIn(b"If eligible", duplicate.data)
-        self.assertIn(b"If eligible", self.form("/resend-confirmation", email="a@sample.test").data)
-        self.assertEqual(self.form("/confirm-email", email="a@sample.test", code="999999").status_code, 400)
-        self.assertIn(b"Email confirmed", self.form("/confirm-email", email="a@sample.test", code="123456").data)
-        self.assertEqual(self.form("/confirm-email", email="a@sample.test", code="123456").status_code, 400)
+        self.assertEqual(self.form("/register", email="short@sample.test", password="").status_code, 400)
+        response = self.form("/register", email="short@sample.test", password="abc")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"longer or stronger password", response.data)
+        self.assertNotIn(b"12 characters", self.browser.get("/register").data)
+        for path in ("/confirm-email", "/forgot-password", "/reset-password", "/resend-confirmation"):
+            self.assertNotIn(path.encode(), self.browser.get("/login").data)
+            self.assertEqual(self.browser.get(path).status_code, 404)
 
     def test_login_validation_cookie_rotation_refresh_and_logout(self):
         self.assertEqual(self.form("/login", email="unconfirmed@sample.test", password=PASSWORD).status_code, 401)
@@ -219,14 +243,12 @@ class AppTest(unittest.TestCase):
         self.browser.set_cookie("__Host-snippet_session", old)
         self.assertEqual(self.browser.get("/").location, "/login")
 
-    def test_password_reset_revokes_web_sessions(self):
-        self.login()
-        self.assertIn(b"If eligible", self.form("/forgot-password", email="unknown@sample.test").data)
-        self.assertIn(b"Password updated", self.form(
-            "/reset-password", email="a@sample.test", password="different secure password", code="123456",
-        ).data)
-        self.assertIn(("POST", "/logout?scope=global", None), auth.provider.calls)
-        self.assertEqual(self.browser.get("/").location, "/login")
+    def test_registration_preserves_vscode_authorization_request(self):
+        path = "/register?authorization_id=" + ATTEMPT
+        notice = self.form(path, email="vscode@sample.test", password=PASSWORD)
+        self.assertEqual(notice.location, "/login?authorization_id=" + ATTEMPT)
+        signin = self.form(notice.location, email="vscode@sample.test", password=PASSWORD)
+        self.assertEqual(signin.location, "/oauth/consent?authorization_id=" + ATTEMPT)
 
     def test_rate_limit_is_shared_across_clients(self):
         for _ in range(8):
