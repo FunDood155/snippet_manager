@@ -5,7 +5,7 @@ import json
 import re
 import secrets
 import time
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID
 
 import requests
@@ -17,6 +17,7 @@ import store
 
 bp = Blueprint("auth", __name__)
 EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+AUTHORIZATION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 CALLBACK_PATH = "/oauth/vscode/callback"
 
 
@@ -206,13 +207,12 @@ def auth_page(mode, error=None, status=200, authorization_id=None, account_email
 
 
 def pending_authorization():
-    value = request.values.get("authorization_id")
-    if value:
-        try:
-            return str(UUID(value))
-        except ValueError:
-            abort(400, "Invalid authorization request.")
-    return None
+    values = request.values.getlist("authorization_id")
+    if not values:
+        return None
+    if len(values) != 1 or not AUTHORIZATION_ID.fullmatch(values[0]):
+        abort(400, "Invalid authorization request.")
+    return values[0]
 
 
 @bp.route("/login", methods=["GET", "POST"])
@@ -339,7 +339,7 @@ def consent():
         abort(400, "Missing authorization request.")
     if not web_identity():
         return redirect(url_for("auth.login", authorization_id=authorization_id))
-    path = f"/oauth/authorizations/{authorization_id}"
+    path = "/oauth/authorizations/" + quote(authorization_id, safe="")
     try:
         details = provider("GET", path, token=g.web_token)
         if "redirect_url" not in details:

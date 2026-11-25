@@ -25,7 +25,7 @@ B = "22222222-2222-4222-8222-222222222222"
 CLIENT = "33333333-3333-4333-8333-333333333333"
 SESSION_A = "44444444-4444-4444-8444-444444444444"
 SESSION_B = "55555555-5555-4555-8555-555555555555"
-ATTEMPT = "66666666-6666-4666-8666-666666666666"
+ATTEMPT = "Aa0123456789_-Bb0123456789_-CcDd"
 PASSWORD = "test-password-A"
 ORIGIN = "https://snippet.test"
 ROOT = Path(__file__).resolve().parents[1]
@@ -318,17 +318,48 @@ class AppTest(unittest.TestCase):
         with patch("auth.provider", side_effect=auth.AuthError(503)):
             self.assertEqual(self.browser.get("/api/session", headers=self.api_b).status_code, 503)
 
+    def test_oauth_rejects_invalid_or_ambiguous_authorization_ids(self):
+        signed_out = self.app.test_client()
+        for value in ("", "../consent", "x/y", "x?y", "x#y", "x%2Fy", "x y", "é", "x\r\ny", "x" * 129):
+            with self.subTest(value=value):
+                response = signed_out.get("/oauth/consent", query_string={"authorization_id": value})
+                self.assertEqual(response.status_code, 400)
+        path = "/oauth/consent?authorization_id=" + ATTEMPT
+        self.assertEqual(signed_out.get(path + "&authorization_id=duplicate").status_code, 400)
+        self.assertEqual(signed_out.get("/oauth/consent").status_code, 400)
+        self.assertEqual(auth.provider.calls, [])
+
+        self.login()
+        token = csrf(self.browser, path)
+        calls = len(auth.provider.calls)
+        response = self.browser.post(path, data={"csrf_token": token, "authorization_id": "conflict", "action": "approve"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(len(auth.provider.calls), calls)
+
+    def test_uuid_shaped_authorization_id_is_preserved_without_normalization(self):
+        opaque_id = "ABCDEF01-2345-6789-ABCD-EF0123456789"
+        response = self.browser.get("/oauth/consent", query_string={"authorization_id": opaque_id})
+        self.assertEqual(response.location, "/login?authorization_id=" + opaque_id)
+
     def test_browser_oauth_redirect_and_provider_revocation(self):
         path = "/oauth/consent?authorization_id=" + ATTEMPT
         self.assertEqual(self.browser.get(path).location, "/login?authorization_id=" + ATTEMPT)
-        self.login()
+        login_path = "/login?authorization_id=" + ATTEMPT
+        credentials = {"csrf_token": csrf(self.browser, login_path), "email": "a@sample.test",
+                       "password": PASSWORD, "authorization_id": ATTEMPT}
+        self.assertEqual(self.browser.post("/login", data=credentials).location, path)
         page = self.browser.get(path)
         self.assertIn(b"Connect VS Code", page.data)
+        self.assertIn(f'name="authorization_id" value="{ATTEMPT}"'.encode(), page.data)
         self.assertEqual(self.browser.post(path, data={"action": "approve"}).status_code, 400)
-        data = {"csrf_token": csrf(self.browser, path), "action": "approve"}
-        self.assertEqual(self.browser.post(path, data=data).location, ORIGIN + auth.CALLBACK_PATH + "?code=foo")
+        data = {"csrf_token": csrf(self.browser, path), "action": "approve", "authorization_id": ATTEMPT}
+        self.assertEqual(
+            self.browser.post("/oauth/consent", data=data).location,
+            ORIGIN + auth.CALLBACK_PATH + "?code=foo",
+        )
+        self.assertIn(("POST", f"/oauth/authorizations/{ATTEMPT}/consent", {"action": "approve"}), auth.provider.calls)
         auth.provider.invalid_redirect = True
-        self.assertEqual(self.browser.post(path, data=data).status_code, 400)
+        self.assertEqual(self.browser.post("/oauth/consent", data=data).status_code, 400)
         callback = self.browser.get(auth.CALLBACK_PATH, query_string={"state": "a" * 43, "code": "test"})
         self.assertIn(b"vscode://code-snippet-manager.code-snippet-manager/auth", callback.data)
         self.assertEqual(self.browser.get(auth.CALLBACK_PATH + "?state=bogus&code=foo").status_code, 400)
