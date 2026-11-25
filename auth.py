@@ -371,4 +371,4 @@ def vscode_callback():
             or len(codes) + len(errors) != 1 or (codes and not re.fullmatch(r"[\w.-]{1,512}", codes[0], re.ASCII))):
         abort(400, "Invalid authorization callback. Restart sign-in from VS Code.")
     payload = {"state": state[0], **({"code": codes[0]} if codes else {"error": "access_denied"})}
-    return render_template("vscode_callback.html", query=urlencode(payload))
+    return render_template("vscode_callback.html", query=urlencode(payload), authorized=bool(codes))

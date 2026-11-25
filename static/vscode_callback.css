@@ -1,0 +1,149 @@
+:root {
+    color-scheme: dark;
+    font-family: "Segoe UI", system-ui, sans-serif;
+    color: #f2f4fa;
+    background: #14151d;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    display: grid;
+    min-height: 100vh;
+    min-height: 100svh;
+    margin: 0;
+    padding: clamp(1rem, 4vw, 3rem);
+    place-items: center;
+    background: radial-gradient(ellipse at 50% 0%, #282740, transparent 60%), #14151d;
+}
+
+.callback {
+    width: min(100%, 33rem);
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: .75rem;
+    margin: 0 0 1.25rem;
+    font-size: 1rem;
+    font-weight: 650;
+}
+
+.brand-mark {
+    display: grid;
+    width: 2.25rem;
+    height: 2.25rem;
+    border: 1px solid #4b4768;
+    border-radius: .625rem;
+    background: #2d2947;
+    color: #d6ccff;
+    font: 700 .85rem ui-monospace, monospace;
+    place-items: center;
+}
+
+.callback-panel {
+    padding: clamp(1.5rem, 6vw, 3.25rem);
+    border: 1px solid #38384a;
+    border-radius: 1.25rem;
+    background: #1f202b;
+    box-shadow: 0 1.25rem 4rem #08081255;
+}
+
+.status-icon {
+    display: grid;
+    width: 3rem;
+    height: 3rem;
+    margin-bottom: 1.25rem;
+    border: 1px solid #3b6358;
+    border-radius: 50%;
+    background: #233632;
+    color: #93e3c4;
+    font-size: 1.65rem;
+    line-height: 1;
+    place-items: center;
+}
+
+.status-icon--declined {
+    border-color: #655468;
+    background: #3a2e3d;
+    color: #e3bdde;
+}
+
+h1 {
+    margin: 0;
+    font-size: clamp(1.75rem, 5vw, 2.25rem);
+    line-height: 1.15;
+    letter-spacing: -.035em;
+    overflow-wrap: anywhere;
+}
+
+.description {
+    max-width: 33ch;
+    margin: .875rem 0 1.75rem;
+    color: #bdc0d1;
+    line-height: 1.6;
+}
+
+.actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: .75rem;
+}
+
+.action {
+    display: grid;
+    min-height: 2.875rem;
+    padding: .625rem .75rem;
+    border: 1px solid transparent;
+    border-radius: .625rem;
+    font-size: .9375rem;
+    font-weight: 650;
+    text-align: center;
+    text-decoration: none;
+    place-items: center;
+}
+
+.action--primary {
+    background: #cbbcff;
+    color: #201638;
+}
+
+.action--primary:hover {
+    background: #e0d7ff;
+}
+
+.action--secondary {
+    border-color: #555569;
+    color: #f2f4fa;
+}
+
+.action--secondary:hover {
+    background: #2c2d3c;
+}
+
+.insiders {
+    display: inline-block;
+    margin-top: 1rem;
+    padding: .375rem 0;
+    color: #bdc0d1;
+    font-size: .875rem;
+    text-underline-offset: .2em;
+}
+
+.insiders:hover {
+    color: #fff;
+}
+
+a:focus-visible {
+    outline: 2px solid #cbbcff;
+    outline-offset: 4px;
+}
+
+@media (max-width: 28rem) {
+    .actions {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}

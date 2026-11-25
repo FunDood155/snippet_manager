@@ -367,6 +367,28 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.browser.get("/api/session", headers=self.api_a).status_code, 401)
         self.assertEqual(self.browser.get("/api/session", headers=self.api_b).status_code, 200)
 
+    def test_callback_success_and_decline_keep_manual_handoff(self):
+        state = "a" * 43
+        for parameters, heading, payload in (
+            ({"code": "test-code"}, b"Authorization successful", "code=test-code"),
+            ({"error": "access_denied"}, b"Authorization declined", "error=access_denied"),
+        ):
+            with self.subTest(parameters=parameters):
+                response = self.browser.get(auth.CALLBACK_PATH, query_string={"state": state, **parameters})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                self.assertIn(heading, response.data)
+                self.assertIn(b"Snippet Manager", response.data)
+                self.assertIn(b'href="/"', response.data)
+                self.assertIn(b"Manage my snippets", response.data)
+                self.assertIn(b"/static/vscode_callback.css", response.data)
+                self.assertNotIn(b"<script", response.data)
+                self.assertIsNone(response.headers.get("Location"))
+                for scheme in ("vscode", "vscode-insiders"):
+                    uri = f'{scheme}://code-snippet-manager.code-snippet-manager/auth?state={state}&amp;{payload}'
+                    self.assertIn(uri.encode(), response.data)
+
     def test_db_rls_and_revoked_api_acl(self):
         row_id = store.add_snippet(A, "SQL fixture", "rls", "fixture")
         with store.cursor(B) as cur:
