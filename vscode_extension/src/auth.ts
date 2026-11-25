@@ -1,6 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
-export const extensionId = 'code-snippet-manager.code-snippet-manager';
+export const extensionId = 'dineshkaarthik.snippo';
 export const authPath = '/auth';
 
 type SecretStorage = {

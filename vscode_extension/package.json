@@ -1,13 +1,14 @@
 {
-  "name": "code-snippet-manager",
-  "displayName": "Code Snippet Manager",
-  "description": "A VS Code extension for managing and inserting code snippets using a Flask API.",
-  "version": "0.0.1",
-  "publisher": "code-snippet-manager",
+  "name": "snippo",
+  "displayName": "Snippo",
+  "description": "Save snippets in your web library, then search and insert them in VS Code.",
+  "version": "1.0.0",
+  "publisher": "dineshkaarthik",
   "engines": {
     "vscode": "^1.137.0"
   },
   "categories": [
+    "Snippets",
     "Other"
   ],
   "activationEvents": [
@@ -19,33 +20,33 @@
     "commands": [
       {
         "command": "code-snippet-manager.showSnippets",
-        "title": "Code Snippet Manager: Show Snippets"
+        "title": "Snippo: Show Snippets"
       },
       {
         "command": "code-snippet-manager.searchSnippets",
-        "title": "Code Snippet Manager: Search Snippets"
+        "title": "Snippo: Search Snippets"
       },
       {
         "command": "code-snippet-manager.insertSnippet",
-        "title": "Code Snippet Manager: Insert Snippet"
+        "title": "Snippo: Insert Snippet"
       },
       {
         "command": "code-snippet-manager.signIn",
-        "title": "Code Snippet Manager: Sign In"
+        "title": "Snippo: Sign In"
       },
       {
         "command": "code-snippet-manager.signOut",
-        "title": "Code Snippet Manager: Sign Out"
+        "title": "Snippo: Sign Out"
       }
     ],
     "configuration": {
-      "title": "Code Snippet Manager",
+      "title": "Snippo",
       "properties": {
         "snippetManager.serverUrl": {
           "type": "string",
           "default": "https://snippet-manager-tan.vercel.app",
           "scope": "application",
-          "description": "Origin of the Code Snippet Manager server. Use HTTPS, or HTTP on loopback for local development."
+          "description": "Origin of the Snippo server. Use HTTPS, or HTTP on loopback for local development."
         }
       }
     }
@@ -73,5 +74,23 @@
   },
   "extensionKind": [
     "ui"
-  ]
+  ],
+  "keywords": [
+    "snippets",
+    "code snippets",
+    "snippet manager",
+    "sync"
+  ],
+  "homepage": "https://snippet-manager-tan.vercel.app",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FunDood155/snippet_manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/FunDood155/snippet_manager/issues"
+  },
+  "galleryBanner": {
+    "color": "#007ACC",
+    "theme": "dark"
+  }
 }

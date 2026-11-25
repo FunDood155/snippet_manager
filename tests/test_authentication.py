@@ -361,7 +361,7 @@ class AppTest(unittest.TestCase):
         auth.provider.invalid_redirect = True
         self.assertEqual(self.browser.post("/oauth/consent", data=data).status_code, 400)
         callback = self.browser.get(auth.CALLBACK_PATH, query_string={"state": "a" * 43, "code": "test"})
-        self.assertIn(b"vscode://code-snippet-manager.code-snippet-manager/auth", callback.data)
+        self.assertIn(b"vscode://dineshkaarthik.snippo/auth", callback.data)
         self.assertEqual(self.browser.get(auth.CALLBACK_PATH + "?state=bogus&code=foo").status_code, 400)
         self.assertEqual(self.browser.post("/oauth/vscode/revoke", data=data).status_code, 200)
         self.assertEqual(self.browser.get("/api/session", headers=self.api_a).status_code, 401)
@@ -379,14 +379,14 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
                 self.assertEqual(response.headers["Cache-Control"], "no-store")
                 self.assertIn(heading, response.data)
-                self.assertIn(b"Snippet Manager", response.data)
+                self.assertIn(b"Snippo", response.data)
                 self.assertIn(b'href="/"', response.data)
                 self.assertIn(b"Manage my snippets", response.data)
                 self.assertIn(b"/static/vscode_callback.css", response.data)
                 self.assertNotIn(b"<script", response.data)
                 self.assertIsNone(response.headers.get("Location"))
                 for scheme in ("vscode", "vscode-insiders"):
-                    uri = f'{scheme}://code-snippet-manager.code-snippet-manager/auth?state={state}&amp;{payload}'
+                    uri = f'{scheme}://dineshkaarthik.snippo/auth?state={state}&amp;{payload}'
                     self.assertIn(uri.encode(), response.data)
 
     def test_db_rls_and_revoked_api_acl(self):

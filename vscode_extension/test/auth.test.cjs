@@ -28,6 +28,7 @@ function callback(params, overrides = {}) {
 }
 
 test('PKCE binds the exact URI and state, and accepts a code once', () => {
+    assert.equal(extensionId, 'dineshkaarthik.snippo');
     const attempt = new SignInRequest(config, origin);
     const url = attempt.url;
     assert.equal(url.origin, config.provider);
@@ -37,7 +38,7 @@ test('PKCE binds the exact URI and state, and accepts a code once', () => {
     assert.equal(url.searchParams.get('scope'), 'openid email');
     assert.equal(url.searchParams.get('state'), attempt.state);
     const params = { state: attempt.state, code: 'synthetic-code' };
-    for (const overrides of [{ authority: 'wrong' }, { scheme: 'https' }, { path: '/other' }, { fragment: 'extra' }]) {
+    for (const overrides of [{ authority: 'wrong' }, { authority: 'code-snippet-manager.code-snippet-manager' }, { scheme: 'https' }, { path: '/other' }, { fragment: 'extra' }]) {
         assert.equal(attempt.accept(callback(params, overrides), 'vscode'), undefined);
     }
     assert.equal(attempt.accept(callback({ ...params, state: 'wrong' }), 'vscode'), undefined);
@@ -45,6 +46,13 @@ test('PKCE binds the exact URI and state, and accepts a code once', () => {
     assert.equal(attempt.accept(callback({ ...params, error: 'access_denied' }), 'vscode'), undefined);
     assert.equal(attempt.accept(callback(params), 'vscode'), 'synthetic-code');
     assert.equal(attempt.accept(callback(params), 'vscode'), undefined);
+});
+
+test('Insiders accepts the new authority and rejects Stable callbacks', () => {
+    const attempt = new SignInRequest(config, origin);
+    const params = { state: attempt.state, code: 'synthetic-code' };
+    assert.equal(attempt.accept(callback(params), 'vscode-insiders'), undefined);
+    assert.equal(attempt.accept(callback(params, { scheme: 'vscode-insiders' }), 'vscode-insiders'), 'synthetic-code');
 });
 
 test('expired callbacks and cancellation do not authorize', async () => {

@@ -3,14 +3,14 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ "Authorization successful" if authorized else "Authorization declined" }} · Snippet Manager</title>
+    <title>{{ "Authorization successful" if authorized else "Authorization declined" }} · Snippo</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='vscode_callback.css') }}">
 </head>
 <body>
     <main class="callback">
         <header class="brand">
             <span class="brand-mark" aria-hidden="true">&lt;/&gt;</span>
-            <span>Snippet Manager</span>
+            <span>Snippo</span>
         </header>
 
         <section class="callback-panel" aria-labelledby="callback-title">
@@ -25,10 +25,10 @@
             {% endif %}
 
             <div class="actions">
-                <a class="action action--primary" href="vscode://code-snippet-manager.code-snippet-manager/auth?{{ query }}">Open VS Code</a>
+                <a class="action action--primary" href="vscode://dineshkaarthik.snippo/auth?{{ query }}">Open VS Code</a>
                 <a class="action action--secondary" href="{{ url_for('home') }}">Manage my snippets</a>
             </div>
-            <a class="insiders" href="vscode-insiders://code-snippet-manager.code-snippet-manager/auth?{{ query }}">Open VS Code Insiders</a>
+            <a class="insiders" href="vscode-insiders://dineshkaarthik.snippo/auth?{{ query }}">Open VS Code Insiders</a>
         </section>
     </main>
 </body>

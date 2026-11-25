@@ -1,5 +1,7 @@
 # Code Snippet Manager — Beginner User Guide
 
+For current extension installation and sign-in, see the [Snippo extension guide](vscode_extension/README.md). The rest of this guide includes older project workflows.
+
 ## 1. What is this project?
 
 Imagine you're learning Python and you keep writing useful pieces of code:
@@ -65,7 +67,7 @@ As a normal user, you mainly need:
 ```text
 VS Code
 +
-Code Snippet Manager extension
+Snippo extension
 ```
 
 That's it.
@@ -165,7 +167,7 @@ You only need:
 ```text
 VS Code
 +
-the Code Snippet Manager .vsix file
+the Snippo .vsix file
 ```
 
 A `.vsix` file is the installable package for a VS Code extension.
@@ -173,7 +175,7 @@ A `.vsix` file is the installable package for a VS Code extension.
 It will look something like:
 
 ```text
-code-snippet-manager-0.0.1.vsix
+snippo-1.0.0.vsix
 ```
 
 ---
@@ -221,7 +223,7 @@ Select it.
 Find:
 
 ```text
-code-snippet-manager-0.0.1.vsix
+snippo-1.0.0.vsix
 ```
 
 and select it.
@@ -249,11 +251,11 @@ Code Snippet Manager
 You should see:
 
 ```text
-Code Snippet Manager: Show Snippets
+Snippo: Show Snippets
 
-Code Snippet Manager: Search Snippets
+Snippo: Search Snippets
 
-Code Snippet Manager: Insert Snippet
+Snippo: Insert Snippet
 ```
 
 If you can see these commands, the extension is installed.
@@ -282,7 +284,7 @@ Ctrl + Shift + P
 Then search:
 
 ```text
-Code Snippet Manager: Show Snippets
+Snippo: Show Snippets
 ```
 
 You should get a selection menu containing your snippets.
@@ -317,7 +319,7 @@ Ctrl + Shift + P
 Run:
 
 ```text
-Code Snippet Manager: Search Snippets
+Snippo: Search Snippets
 ```
 
 You will see:
@@ -380,7 +382,7 @@ Ctrl + Shift + P
 Run:
 
 ```text
-Code Snippet Manager: Insert Snippet
+Snippo: Insert Snippet
 ```
 
 Select:
@@ -920,7 +922,7 @@ If you just want the shortest possible instructions:
 ```text
 1. Install VS Code
         ↓
-2. Get the Code Snippet Manager .vsix
+2. Get the Snippo .vsix
         ↓
 3. Open VS Code
         ↓
@@ -934,7 +936,7 @@ If you just want the shortest possible instructions:
         ↓
 8. Ctrl + Shift + P
         ↓
-9. Search "Code Snippet Manager"
+9. Search "Snippo"
         ↓
 10. Use Show / Search / Insert
 ```

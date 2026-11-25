@@ -17,9 +17,9 @@ export function activate(context: vscode.ExtensionContext) {
 
     async function updateStatus() {
         const signedIn = await auth.hasSession();
-        status.text = signedIn ? '$(account) Snippets: Signed in' : '$(account) Snippets: Signed out';
+        status.text = signedIn ? '$(account) Snippo: Signed in' : '$(account) Snippo: Signed out';
         status.command = `${namespace}.${signedIn ? 'signOut' : 'signIn'}`;
-        status.tooltip = signedIn ? 'Sign out of Code Snippet Manager' : 'Sign in to Code Snippet Manager';
+        status.tooltip = signedIn ? 'Sign out of Snippo' : 'Sign in to Snippo';
         status.show();
     }
 
@@ -35,7 +35,7 @@ export function activate(context: vscode.ExtensionContext) {
                         await vscode.commands.executeCommand(`${namespace}.signIn`);
                     }
                 } else {
-                    void vscode.window.showErrorMessage('Could not complete the request. Check your Snippet Manager server and connection.');
+                    void vscode.window.showErrorMessage('Could not complete the request. Check your Snippo server and connection.');
                 }
             }
         }));
@@ -74,7 +74,7 @@ export function activate(context: vscode.ExtensionContext) {
         try {
             await vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
-                title: 'Signing in to Code Snippet Manager',
+                title: 'Signing in to Snippo',
                 cancellable: true,
             }, async (_progress, token) => {
                 const subscription = token.onCancellationRequested(() => controller.abort());
@@ -100,7 +100,7 @@ export function activate(context: vscode.ExtensionContext) {
                             }
                         }
                         if (!controller.signal.aborted) {
-                            void vscode.window.showInformationMessage('Signed in to Code Snippet Manager.');
+                            void vscode.window.showInformationMessage('Signed in to Snippo.');
                         }
                     } else if (!token.isCancellationRequested && initialGeneration === generation) {
                         void vscode.window.showInformationMessage('Sign-in was declined or expired. You can start again.');
@@ -123,7 +123,7 @@ export function activate(context: vscode.ExtensionContext) {
         const revoked = await auth.signOut();
         await updateStatus();
         if (revoked) {
-            void vscode.window.showInformationMessage('Signed out of Code Snippet Manager.');
+            void vscode.window.showInformationMessage('Signed out of Snippo.');
         } else {
             void vscode.window.showWarningMessage('Signed out here. The server could not confirm session revocation.');
         }
