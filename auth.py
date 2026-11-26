@@ -18,6 +18,8 @@ import store
 bp = Blueprint("auth", __name__)
 EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 AUTHORIZATION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+EMAIL_TOKEN_HASH = re.compile(r"[A-Za-z0-9_-]{20,256}")
+EMAIL_LINK_PATHS = {"signup": "/auth/confirm-email", "recovery": "/auth/reset-password"}
 CALLBACK_PATH = "/oauth/vscode/callback"
 
 
@@ -99,10 +101,34 @@ def confirmed_identity(user):
         raise AuthError(401) from None
 
 
+def token_claims(token):
+    middle = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(middle + "=" * (-len(middle) % 4)))
+
+
+def check_account_access(cur, owner, verified_token):
+    cur.execute(
+        """SELECT EXISTS (SELECT 1 FROM snippet_private.legacy_email_holds WHERE user_id = %s),
+                  (SELECT invalid_through FROM snippet_private.session_cutoffs WHERE user_id = %s)""",
+        (owner, owner),
+    )
+    held, invalid_through = cur.fetchone()
+    if held:
+        raise AuthError(401, "legacy_email_hold")
+    if invalid_through is not None:
+        try:
+            issued_at = token_claims(verified_token)["iat"]
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+            raise AuthError(401) from None
+        if type(issued_at) is not int or issued_at <= invalid_through:
+            raise AuthError(401)
+
+
 def create_session(tokens):
     owner = confirmed_identity(tokens["user"])
     handle = secrets.token_urlsafe(32)
     with store.cursor() as cur:
+        check_account_access(cur, owner, tokens["access_token"])
         if session.get("handle"):
             cur.execute("DELETE FROM snippet_private.web_sessions WHERE handle_hash = %s", (digest(session["handle"]),))
         cur.execute("DELETE FROM snippet_private.web_sessions WHERE expires_at <= now()")
@@ -132,6 +158,7 @@ def web_identity():
         if row:
             owner, access, refresh, expires_at = row
             try:
+                check_account_access(cur, owner, access)
                 # Row-level lock serializes refresh from multiple browser tabs or Flask workers.
                 if expires_at < time.time() + 45:
                     tokens = provider("POST", "/token?grant_type=refresh_token", body={"refresh_token": refresh})
@@ -164,14 +191,14 @@ def api_identity():
     try:
         owner = str(UUID(user["sub"]))
         # Read claims only after Supabase has authenticated this exact bearer token.
-        middle = token.split(".")[1]
-        claims = json.loads(base64.urlsafe_b64decode(middle + "=" * (-len(middle) % 4)))
+        claims = token_claims(token)
         provider_session_id = str(UUID(claims["session_id"]))
         if user["email_verified"] is not True or claims["sub"] != owner or claims["client_id"] != vscode_client():
             raise AuthError(401)
     except (KeyError, IndexError, TypeError, ValueError):
         raise AuthError(401) from None
     with store.cursor() as cur:
+        check_account_access(cur, owner, token)
         cur.execute("SELECT 1 FROM snippet_private.revoked_vscode_sessions WHERE id = %s", (provider_session_id,))
         if cur.fetchone():
             raise AuthError(401)
@@ -230,7 +257,7 @@ def login():
         create_session(tokens)
     except AuthError as exc:
         if exc.status in (400, 401, 403, 422):
-            return auth_page("login", "Sign-in failed. Check your email address and password.", 401,
+            return auth_page("login", "Sign-in failed. Check your credentials or request a new confirmation link.", 401,
                              authorization_id=authorization_id)
         raise
     if authorization_id:
@@ -257,10 +284,13 @@ def register():
 
     limit("register", email, 3, 40)
     try:
-        tokens = provider("POST", "/signup", body={"email": email, "password": password})
+        if provider("GET", "/settings").get("mailer_autoconfirm") is not False:
+            abort(503, "Email verification is unavailable.")
+        tokens = provider("POST", email_provider_path("/signup", "signup"),
+                          body={"email": email, "password": password})
     except AuthError as exc:
         # Return the same public response for a new address and a duplicate address.
-        if exc.code in ("user_already_exists", "email_exists"):
+        if exc.status == 429 or exc.code in ("user_already_exists", "email_exists"):
             tokens = {}
         elif exc.code == "weak_password":
             return auth_page("register", "Choose a longer or stronger password.", 400,
@@ -280,8 +310,151 @@ def register():
         except AuthError:
             current_app.logger.warning("Could not revoke an unused registration session")
 
-    flash("You can now try signing in with your email and password.", "registration")
+    flash("If this address can be registered, check your inbox for a verification link.", "registration")
     return redirect(url_for("auth.login", authorization_id=authorization_id), code=303)
+
+
+def email_provider_path(path, kind):
+    site = current_app.config["SNIPPET_SITE_URL"]
+    return path + "?" + urlencode({"redirect_to": site + EMAIL_LINK_PATHS[kind]})
+
+
+@bp.route("/resend-confirmation", methods=["GET", "POST"], endpoint="resend_confirmation")
+@bp.route("/forgot-password", methods=["GET", "POST"], endpoint="forgot_password")
+def request_email_link():
+    recovery = request.endpoint == "auth.forgot_password"
+    mode = "forgot" if recovery else "resend"
+    if request.method == "GET":
+        return auth_page(mode)
+    email = request.form.get("email", "").strip().lower()
+    if not valid_email(email):
+        return auth_page(mode, "Enter a valid email address.", 400)
+    limit("recover" if recovery else "resend", email, 3, 30)
+    kind = "recovery" if recovery else "signup"
+    body = {"email": email} if recovery else {"email": email, "type": "signup"}
+    try:
+        provider("POST", email_provider_path("/recover" if recovery else "/resend", kind), body=body)
+    except AuthError as exc:
+        # Provider responses can differ by account existence or email quota.
+        if exc.status not in (400, 404, 422, 429):
+            raise
+    flash("If this address is eligible, check your inbox for the link. Allow a few minutes for delivery.", "registration")
+    return redirect(url_for("auth.login"), code=303)
+
+
+@bp.route(EMAIL_LINK_PATHS["signup"], methods=["GET", "POST"], endpoint="confirm_email")
+@bp.route(EMAIL_LINK_PATHS["recovery"], methods=["GET", "POST"], endpoint="reset_password")
+def email_link():
+    recovery = request.endpoint == "auth.reset_password"
+    kind = "recovery" if recovery else "signup"
+    if request.method == "GET":
+        return auth_page("recovery_link" if recovery else "confirm_link")
+
+    hashes = request.form.getlist("token_hash")
+    if len(hashes) != 1 or not EMAIL_TOKEN_HASH.fullmatch(hashes[0]):
+        return auth_page("invalid_link", status=400)
+    proof = hashes[0]
+    limit("email-link", proof, 5, 120)
+    try:
+        tokens = provider("POST", "/verify", body={"token_hash": proof, "type": kind})
+        owner = confirmed_identity(tokens.get("user", {}))
+        access = tokens["access_token"]
+    except AuthError as exc:
+        if exc.status not in (400, 401, 403, 404, 422):
+            raise
+        return auth_page("invalid_link", status=400)
+
+    if recovery:
+        handle = secrets.token_urlsafe(32)
+        with store.cursor() as cur:
+            cur.execute("DELETE FROM snippet_private.email_flows WHERE expires_at <= now()")
+            if session.get("email_flow"):
+                cur.execute("DELETE FROM snippet_private.email_flows WHERE handle_hash = %s",
+                            (digest(session["email_flow"]),))
+            cur.execute(
+                """INSERT INTO snippet_private.email_flows (handle_hash, owner_id, access_token, expires_at)
+                   VALUES (%s, %s, %s, now() + interval '10 minutes')""",
+                (digest(handle), owner, access),
+            )
+        session.clear()
+        session["email_flow"] = handle
+        return redirect(url_for("auth.new_password"), code=303)
+
+    discard_provider_session(access)
+    flash("Email verified. Sign in to continue. If you started in VS Code, start its sign-in again.", "registration")
+    return redirect(url_for("auth.login"), code=303)
+
+
+@bp.route("/auth/new-password", methods=["GET", "POST"])
+def new_password():
+    handle = session.get("email_flow")
+    if handle:
+        with store.cursor() as cur:
+            cur.execute(
+                """SELECT access_token, owner_id FROM snippet_private.email_flows
+                   WHERE handle_hash = %s AND expires_at > now() FOR UPDATE""",
+                (digest(handle),),
+            )
+            row = cur.fetchone()
+            if row:
+                access, owner = row
+                if request.method == "GET":
+                    return auth_page("reset")
+                return finish_password_reset(cur, owner, access, handle)
+        session.pop("email_flow", None)
+    return auth_page("invalid_link", status=400)
+
+
+def discard_provider_session(access):
+    try:
+        provider("POST", "/logout?scope=local", token=access)
+    except AuthError:
+        current_app.logger.warning("Could not revoke an unused email-flow session")
+
+
+def finish_password_reset(cur, owner, access, handle):
+    password = request.form.get("password", "")
+    if not password or len(password.encode()) > 72 or password != request.form.get("password_confirmation"):
+        return auth_page("reset", "Enter matching passwords of up to 72 bytes.", 400)
+    try:
+        provider("PUT", "/user", token=access, body={"password": password})
+    except AuthError as exc:
+        if exc.code in ("weak_password", "same_password"):
+            return auth_page("reset", "Choose a different, stronger password.", 400)
+        if exc.status not in (401, 403, 404):
+            raise
+        cur.execute("DELETE FROM snippet_private.email_flows WHERE handle_hash = %s", (digest(handle),))
+        session.pop("email_flow", None)
+        return auth_page("invalid_link", status=400)
+
+    # Supabase's password update revokes other sessions. Block outstanding JWTs in Snippo too.
+    cur.execute(
+        """INSERT INTO snippet_private.session_cutoffs VALUES (%s, floor(extract(epoch FROM clock_timestamp()))::bigint)
+           ON CONFLICT (user_id) DO UPDATE
+           SET invalid_through = greatest(session_cutoffs.invalid_through, excluded.invalid_through)""",
+        (owner,),
+    )
+    cur.execute("DELETE FROM snippet_private.web_sessions WHERE user_id = %s", (owner,))
+    # Consume this flow before revocation calls so a provider outage cannot allow replay.
+    cur.execute("DELETE FROM snippet_private.email_flows WHERE handle_hash = %s", (digest(handle),))
+    cur.connection.commit()
+    session.clear()
+
+    try:
+        client_id = current_app.config["SNIPPET_VSCODE_CLIENT_ID"]
+        if client_id:
+            try:
+                provider("DELETE", "/user/oauth/grants?" + urlencode({"client_id": client_id}), token=access)
+            except AuthError as exc:
+                if exc.status != 404:
+                    raise
+    except AuthError:
+        current_app.logger.warning("Could not revoke the previous VS Code consent after password reset")
+    finally:
+        discard_provider_session(access)
+
+    flash("Password changed. Sign in again on the website and in VS Code.", "registration")
+    return redirect(url_for("auth.login"), code=303)
 
 
 def end_web_session():

@@ -77,6 +77,8 @@ def create_app(config=None):
                 "default-src 'none'; style-src 'self'; form-action 'self'; "
                 "base-uri 'none'; frame-ancestors 'none'"
             )
+            if request.endpoint in {"auth.confirm_email", "auth.reset_password"}:
+                response.headers["Content-Security-Policy"] += "; script-src 'self'"
         return response
 
     @app.errorhandler(auth.AuthError)

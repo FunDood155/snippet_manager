@@ -73,12 +73,11 @@ Official references: [password auth](https://supabase.com/docs/guides/auth/passw
    that dedicated runtime login, with TLS certificate verification for hosted
    PostgreSQL. The app checks that both PostgreSQL session and current roles
    are `snippet_app`. The old `DATABASE_URL` is unused.
-3. Enable email/password signup. For private testing, turn **Confirm email**
-   off in the Supabase dashboard. For a local CLI stack set
-   `auth.email.enable_confirmations` to `false` and restart the stack.
-   Registration sends users to sign-in, and Supabase enforces its configured
-   password policy. Keep refresh-token rotation enabled. The app does not
-   currently offer email confirmation or password recovery screens.
+3. Apply the public-authentication migration after the ownership and starter
+   migrations. For a fresh isolated environment, configure email confirmation
+   and recovery using the templates in [Public authentication rollout](public-authentication.md).
+   Keep refresh-token rotation enabled. On a local CLI stack set
+   `auth.email.enable_confirmations` to `true` and use the local mail inbox.
 4. Set the Supabase Auth Site URL to `SNIPPET_SITE_URL`. Enable the OAuth 2.1
    server, set the authorization path to `/oauth/consent`, and leave dynamic
    client registration off. Register a **public** client with no secret and one
@@ -94,7 +93,7 @@ Official references: [password auth](https://supabase.com/docs/guides/auth/passw
 ## Default starter snippets
 
 New accounts created after the starter migration receive four owned Python
-snippets at signup when Supabase automatically confirms the address.
+snippets after verifying their email address.
 The database provisions them in the same transaction and records pending
 accounts in a private table until confirmation. Existing accounts receive no
 backfill. Deleting a starter is permanent unless the user creates it again.
@@ -143,7 +142,7 @@ These steps are for a separately authorized integration window.
    retain the migration and owner mapping. The unprotected legacy app must stay
    offline. If unwinding the database change before ownership is populated, an
    administrator can use `supabase/rollback_wp01.sql` after reversing the
-   starter migration. It refuses to remove
+   public-authentication and starter migrations (in that order). It refuses to remove
    ownership if any rows are assigned. Export and reconcile those assignments
    before considering a separate rollback. The rollback script leaves Data API
    roles revoked and RLS enabled. It drops only WP-01 support objects and the
@@ -174,7 +173,7 @@ The new extension has its own SecretStorage. Disable or uninstall the old extens
 For a manual test install the VSIX with **Extensions: Install from VSIX** in a
 clean desktop VS Code profile that satisfies the manifest's engine version.
 
-- Register and sign in with two test accounts. Verify each receives four starter
+- Register and verify two test accounts before signing in. Verify each receives four starter
   snippets. Register again using the same address and a different password,
   then verify that the original password still works. Sign out and confirm
   access to the snippet library requires signing in again.

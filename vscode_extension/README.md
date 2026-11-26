@@ -38,7 +38,7 @@ Individual snippets can be deleted in the web library. Account-wide VS Code acce
 
 - Snippo depends on an available Flask server and Supabase Auth. The default URL can be restricted during private testing, and the backend must support the `dineshkaarthik.snippo` callback before the new extension can sign in.
 - VS Code for the Web and offline snippet access are outside the current supported flow. Use the web library to manage snippets.
-- Email ownership is not verified in the current private-test configuration. Password recovery is currently unavailable in the web app. Use a test address you control.
+- The public-authentication build requires email verification and supports password recovery in the web app. Availability depends on the deployed backend and its email configuration. Use a test address you control during private testing.
 - If the extension cannot reach the server when signing out, it clears local credentials and reports that server revocation could not be confirmed. Use web revocation when the server is available.
 
 Report bugs at [GitHub Issues](https://github.com/FunDood155/snippet_manager/issues). Include the extension version and reproduction steps with sensitive details removed.

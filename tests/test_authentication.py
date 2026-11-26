@@ -22,15 +22,22 @@ import store
 
 A = "11111111-1111-4111-8111-111111111111"
 B = "22222222-2222-4222-8222-222222222222"
+HELD = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+CONFIRM_LINK = "/auth/confirm-email"
+RESET_LINK = "/auth/reset-password"
+NEW_PASSWORD = "/auth/new-password"
 CLIENT = "33333333-3333-4333-8333-333333333333"
 SESSION_A = "44444444-4444-4444-8444-444444444444"
 SESSION_B = "55555555-5555-4555-8555-555555555555"
 ATTEMPT = "Aa0123456789_-Bb0123456789_-CcDd"
 PASSWORD = "test-password-A"
+FIXTURE_ISSUED_AT = int(time.time()) - 60
 ORIGIN = "https://snippet.test"
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = next((ROOT / "supabase/migrations").glob("*_snippet_ownership.sql")).read_text()
 STARTER_MIGRATION = next((ROOT / "supabase/migrations").glob("*_default_starter_snippets.sql")).read_text()
+PUBLIC_AUTH = next((ROOT / "supabase/migrations").glob("*_public_authentication.sql")).read_text()
+PUBLIC_UNDO = (ROOT / "supabase/rollback_public_authentication.sql").read_text()
 STARTER_UNDO = (ROOT / "supabase/rollback_starter_snippets.sql").read_text()
 STARTERS = {
     "Hello World": "Basics",
@@ -42,8 +49,9 @@ UNDO = (ROOT / "supabase/rollback_wp01.sql").read_text()
 LEGACY = (17, "Legacy name", "legacy category", "legacy code")
 
 
-def fake_jwt(owner, session_id, client_id=CLIENT, signature="fixture"):
-    payload = json.dumps({"sub": owner, "client_id": client_id, "session_id": session_id}).encode()
+def fake_jwt(owner, session_id, client_id=CLIENT, signature="fixture", issued_at=None):
+    payload = json.dumps({"sub": owner, "client_id": client_id, "session_id": session_id,
+                          "iat": FIXTURE_ISSUED_AT if issued_at is None else issued_at}).encode()
     return "header." + base64.urlsafe_b64encode(payload).decode().rstrip("=") + "." + signature
 
 
@@ -63,13 +71,37 @@ class MockProvider:
         self.confirmed = {"a@sample.test": A, "b@sample.test": B}
         self.token_user = {}
         self.passwords = {}
+        self.pending = {}
+        self.links = {}
+        self.autoconfirm = False
+        self.token_offset = 0
         self.create_account = None
+        self.confirm_account = None
         self.invalid_redirect = False
 
     def __call__(self, method, path, *, token=None, body=None):
         self.calls.append((method, path, body))
+        if path == "/settings":
+            return {"mailer_autoconfirm": self.autoconfirm}
+        if path == "/verify":
+            pending = self.links.get(body["token_hash"])
+            if not pending or pending[0] != body["type"]:
+                raise auth.AuthError(403, "otp_expired")
+            kind, email = self.links.pop(body["token_hash"])
+            if kind == "signup":
+                user = self.pending.pop(email)
+                self.confirm_account(user)
+                self.confirmed[email] = user
+            return self.tokens(self.confirmed[email])
+        if path.partition("?")[0] in ("/recover", "/resend"):
+            address = body["email"]
+            if address not in self.confirmed and address not in self.pending:
+                raise auth.AuthError(404)
+            return {}
         if path == "/token?grant_type=password":
             user = self.confirmed.get(body["email"])
+            if body["email"] in self.pending:
+                raise auth.AuthError(400, "email_not_confirmed")
             if not user or body["password"] != self.passwords.get(body["email"], PASSWORD):
                 raise auth.AuthError(400)
             return self.tokens(user)
@@ -84,16 +116,22 @@ class MockProvider:
             if token not in self.token_user:
                 raise auth.AuthError(403)
             return {"id": self.token_user[token], "email_confirmed_at": "fixture"}
-        if path == "/signup":
+        if path == "/user" and method == "PUT":
+            if token not in self.token_user:
+                raise auth.AuthError(403)
+            owner = self.token_user[token]
+            email = next(email for email, user in self.confirmed.items() if user == owner)
+            self.passwords[email] = body["password"]
+            return {"id": owner}
+        if path.partition("?")[0] == "/signup":
             email, password = body["email"], body["password"]
             if len(password) < 6:
                 raise auth.AuthError(422, "weak_password")
-            if email in self.confirmed:
+            if email in self.confirmed or email in self.pending:
                 raise auth.AuthError(422, "user_already_exists")
-            user = self.create_account(confirmed=True)
-            self.confirmed[email] = user
+            self.pending[email] = self.create_account()
             self.passwords[email] = password
-            return self.tokens(user)
+            return {}
         if path == "/oauth/authorizations/" + ATTEMPT:
             return {"client": {"id": CLIENT}, "redirect_uri": ORIGIN + auth.CALLBACK_PATH}
         if path == "/oauth/authorizations/" + ATTEMPT + "/consent":
@@ -108,7 +146,9 @@ class MockProvider:
 
     def tokens(self, owner):
         n = len(self.calls)
-        access, refresh = f"access-{n}", f"refresh-{n}"
+        access = fake_jwt(owner, str(uuid4()), client_id=None, signature=f"web-{n}",
+                          issued_at=int(time.time()) + self.token_offset)
+        refresh = f"refresh-{n}"
         self.token_user[access] = self.token_user[refresh] = owner
         return {"user": {"id": owner, "email_confirmed_at": "fixture"},
                 "access_token": access, "refresh_token": refresh, "expires_in": 3600}
@@ -160,13 +200,17 @@ class AppTest(unittest.TestCase):
                 cur.execute("SET ROLE wp01_migrator")
                 cur.execute(STARTER_MIGRATION)
                 cur.execute("RESET ROLE")
+                cur.execute("INSERT INTO auth.users (id) VALUES (%s)", (HELD,))
+                cur.execute(PUBLIC_AUTH)
+                cur.execute("DELETE FROM snippet_private.legacy_email_holds WHERE user_id IN (%s, %s)", (A, B))
                 cur.execute("ALTER ROLE snippet_app LOGIN PASSWORD 'fixture-only'")
 
     def setUp(self):
         with closing(psycopg2.connect(self.admin)) as conn:
             with conn, conn.cursor() as cur:
                 cur.execute("DELETE FROM public.snippets WHERE owner_id IS NOT NULL")
-                cur.execute("TRUNCATE snippet_private.web_sessions, snippet_private.auth_limits, snippet_private.revoked_vscode_sessions")
+                cur.execute("""TRUNCATE snippet_private.web_sessions, snippet_private.auth_limits,
+                    snippet_private.revoked_vscode_sessions, snippet_private.session_cutoffs, snippet_private.email_flows""")
         patches = (patch.dict(os.environ, {"SNIPPET_DATABASE_URL": self.runtime}),
                    patch("auth.provider", MockProvider()))
         for item in patches:
@@ -179,6 +223,7 @@ class AppTest(unittest.TestCase):
             "SESSION_COOKIE_NAME": "__Host-snippet_session", "SESSION_COOKIE_SECURE": True,
         })
         auth.provider.create_account = self.create_account
+        auth.provider.confirm_account = self.confirm_account
         self.browser = self.app.test_client()
         self.api_a = bearer(fake_jwt(A, SESSION_A))
         self.api_b = bearer(fake_jwt(B, SESSION_B))
@@ -202,7 +247,14 @@ class AppTest(unittest.TestCase):
         self.assertEqual((first.status_code, first.location), (303, "/login"))
         self.assertEqual((duplicate.status_code, duplicate.location), (303, "/login"))
         self.assertEqual(first.data, duplicate.data)
-        self.assertIn(b"try signing in", self.browser.get("/login").data)
+        self.assertIn(b"check your inbox", self.browser.get("/login").data)
+        owner = auth.provider.pending[email]
+        self.assertEqual(store.list_snippets(owner)[0], [])
+        pending_token = fake_jwt(owner, str(uuid4()))
+        with patch("auth.provider", return_value={"sub": owner, "email_verified": False}):
+            self.assertEqual(self.browser.get("/api/snippets", headers=bearer(pending_token)).status_code, 401)
+        self.assertIn(b"request a new confirmation", self.form("/login", email=email, password=password).data)
+        self.verify_email_token("signup", email)
         self.assertEqual(self.browser.get("/").location, "/login")
         self.assertEqual(self.form("/login", email=email, password="other-password").status_code, 401)
         self.assertEqual(self.form("/login", email=email, password=password).status_code, 303)
@@ -221,9 +273,112 @@ class AppTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn(b"longer or stronger password", response.data)
         self.assertNotIn(b"12 characters", self.browser.get("/register").data)
-        for path in ("/confirm-email", "/forgot-password", "/reset-password", "/resend-confirmation"):
-            self.assertNotIn(path.encode(), self.browser.get("/login").data)
-            self.assertEqual(self.browser.get(path).status_code, 404)
+        for path in ("/forgot-password", "/resend-confirmation"):
+            self.assertIn(path.encode(), self.browser.get("/login").data)
+            self.assertEqual(self.browser.get(path).status_code, 200)
+
+    def verify_email_token(self, kind, email, client=None):
+        client = client or self.browser
+        path = CONFIRM_LINK if kind == "signup" else RESET_LINK
+        value = uuid4().hex
+        auth.provider.links[value] = (kind, email)
+        landing = client.get(path)
+        self.assertEqual(landing.status_code, 200)
+        self.assertNotIn(value, landing.headers.get("Set-Cookie", ""))
+        self.assertNotIn(value.encode(), landing.data)
+        self.assertIn(b"/static/email_link.js", landing.data)
+        self.assertIn("script-src 'self'", landing.headers["Content-Security-Policy"])
+        self.assertIn(value, auth.provider.links)
+        self.assertEqual(landing.headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(landing.headers["Cache-Control"], "no-store")
+        self.assertEqual(client.post(path, data={}).status_code, 400)
+        self.assertIn(value, auth.provider.links)
+        return client.post(path, data={"csrf_token": csrf(client, path), "token_hash": value})
+
+    def test_email_link_wrong_type_expired_and_replayed(self):
+        email = "b@sample.test"
+        value = uuid4().hex
+        auth.provider.links[value] = ("recovery", email)
+        wrong = self.form(CONFIRM_LINK, token_hash=value, type="recovery", next="https://bad.test")
+        self.assertEqual(wrong.status_code, 400)
+        self.assertIn(value, auth.provider.links)
+        self.assertEqual(self.form(RESET_LINK, token_hash=uuid4().hex).status_code, 400)
+        self.assertEqual(self.form(RESET_LINK, token_hash=value).location, NEW_PASSWORD)
+        self.assertEqual(self.form(RESET_LINK, token_hash=value).status_code, 400)
+        self.verify_email_token("recovery", email)
+        self.assertEqual(self.browser.get("/").location, "/login")
+        self.assertEqual(self.form(CONFIRM_LINK, password="other-pass").status_code, 400)
+        self.assertEqual(self.browser.get("/api/snippets", headers=bearer(fake_jwt(B, SESSION_B, client_id=None))).status_code, 401)
+        with store.cursor() as cur:
+            cur.execute("UPDATE snippet_private.email_flows SET expires_at = now() - interval '1 second'")
+        self.assertEqual(self.browser.get(NEW_PASSWORD).status_code, 400)
+
+    def test_recovery_changes_password_and_revokes_stale_sessions(self):
+        original = self.browser
+        self.login()
+        recovery = self.app.test_client()
+        self.assertEqual(self.verify_email_token("recovery", "a@sample.test", recovery).location, NEW_PASSWORD)
+        self.assertEqual(recovery.get("/").location, "/login")
+        self.browser = recovery
+        self.assertEqual(self.form(NEW_PASSWORD, password="new-pass", password_confirmation="different").status_code, 400)
+        token = csrf(recovery, NEW_PASSWORD)
+        values = {"csrf_token": token, "password": "new-pass", "password_confirmation": "new-pass"}
+        self.assertEqual(recovery.post(NEW_PASSWORD, data=values).location, "/login")
+        self.assertEqual(recovery.post(NEW_PASSWORD, data=values).status_code, 400)
+        self.assertEqual(original.get("/").location, "/login")
+        # Simulate a still-valid old JWT after provider logout.
+        old_jwt = fake_jwt(A, SESSION_A)
+        auth.provider.oauth_tokens[old_jwt] = A
+        self.assertEqual(self.browser.get("/api/snippets", headers=bearer(old_jwt)).status_code, 401)
+        self.assertEqual(self.browser.get("/api/snippets", headers=self.api_b).status_code, 200)
+        auth.provider.token_offset = 2
+        self.assertEqual(self.form("/login", email="a@sample.test", password=PASSWORD).status_code, 401)
+        self.assertEqual(self.form("/login", email="a@sample.test", password="new-pass").location, "/")
+        self.assertTrue(any(method == "DELETE" and path.startswith("/user/oauth/grants?")
+                            for method, path, _ in auth.provider.calls))
+
+    def test_held_legacy_account_cannot_use_verified_credentials_or_tokens(self):
+        email = "legacy@sample.test"
+        auth.provider.confirmed[email] = HELD
+        old_jwt = fake_jwt(HELD, SESSION_A)
+        auth.provider.oauth_tokens[old_jwt] = HELD
+        self.assertEqual(self.form("/login", email=email, password=PASSWORD).status_code, 401)
+        self.assertEqual(self.browser.get("/api/snippets", headers=bearer(old_jwt)).status_code, 401)
+        with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM snippet_private.legacy_email_holds WHERE user_id=%s", (HELD,))
+        stale = self.browser
+        self.assertEqual(self.login(email).location, "/")
+        with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+            cur.execute("INSERT INTO snippet_private.legacy_email_holds VALUES (%s)", (HELD,))
+        self.assertEqual(stale.get("/").location, "/login")
+        self.verify_email_token("recovery", email)
+        self.assertEqual(self.form(NEW_PASSWORD, password="other-pass", password_confirmation="other-pass").location, "/login")
+        auth.provider.token_offset = 2
+        self.assertEqual(self.form("/login", email=email, password="other-pass").status_code, 401)
+        with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM snippet_private.legacy_email_holds WHERE user_id=%s", (HELD,))
+            self.assertEqual(cur.fetchone(), (1,))
+            cur.execute("DELETE FROM snippet_private.legacy_email_holds WHERE user_id=%s", (HELD,))
+        try:
+            auth.provider.oauth_tokens[old_jwt] = HELD
+            self.assertEqual(self.browser.get("/api/snippets", headers=bearer(old_jwt)).status_code, 401)
+            self.assertEqual(self.form("/login", email=email, password="other-pass").location, "/")
+        finally:
+            with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+                cur.execute("INSERT INTO snippet_private.legacy_email_holds VALUES (%s)", (HELD,))
+
+    def test_resend_recovery_rate_limits_and_provider_failures(self):
+        for path in ("/resend-confirmation", "/forgot-password"):
+            for _ in range(3):
+                self.assertEqual(self.form(path, email="unknown@sample.test").location, "/login")
+            self.assertEqual(self.form(path, email="unknown@sample.test").status_code, 429)
+            with patch("auth.provider", side_effect=auth.AuthError(429)):
+                self.assertEqual(self.form(path, email="b@sample.test").location, "/login")
+            with patch("auth.provider", side_effect=auth.AuthError(503)):
+                self.assertEqual(self.form(path, email="b@sample.test").status_code, 503)
+        auth.provider.autoconfirm = True
+        self.assertEqual(self.form("/register", email="disabled@sample.test", password=PASSWORD).status_code, 503)
+        self.assertNotIn("disabled@sample.test", auth.provider.pending)
 
     def test_login_validation_cookie_rotation_refresh_and_logout(self):
         self.assertEqual(self.form("/login", email="unconfirmed@sample.test", password=PASSWORD).status_code, 401)
@@ -247,6 +402,7 @@ class AppTest(unittest.TestCase):
         path = "/register?authorization_id=" + ATTEMPT
         notice = self.form(path, email="vscode@sample.test", password=PASSWORD)
         self.assertEqual(notice.location, "/login?authorization_id=" + ATTEMPT)
+        self.verify_email_token("signup", "vscode@sample.test")
         signin = self.form(notice.location, email="vscode@sample.test", password=PASSWORD)
         self.assertEqual(signin.location, "/oauth/consent?authorization_id=" + ATTEMPT)
 
@@ -544,7 +700,8 @@ class AppTest(unittest.TestCase):
     def test_migration_rollback_fails_closed_with_assigned_rows_and_preserves_legacy(self):
         starter_rollback = STARTER_UNDO.strip().removeprefix("BEGIN;").removesuffix("COMMIT;")
         ownership_rollback = UNDO.strip().removeprefix("BEGIN;").removesuffix("COMMIT;")
-        rollback_body = "SET LOCAL ROLE wp01_migrator;" + starter_rollback + "RESET ROLE;" + ownership_rollback
+        public_rollback = PUBLIC_UNDO.split("BEGIN;", 1)[1].removesuffix("COMMIT;\n")
+        rollback_body = public_rollback + "SET LOCAL ROLE wp01_migrator;" + starter_rollback + "RESET ROLE;" + ownership_rollback
         store.add_snippet(A, "keep", "rls", "keep")
         with closing(psycopg2.connect(self.admin)) as conn, conn.cursor() as cur:
             with self.assertRaises(psycopg2.errors.RaiseException):
