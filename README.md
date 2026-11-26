@@ -611,3 +611,7 @@ VS Code Extension
 +
 Cloud Deployment
 ```
+
+## License
+
+Snippo is licensed under the [MIT License](LICENSE).

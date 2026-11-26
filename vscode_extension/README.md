@@ -42,3 +42,7 @@ Individual snippets can be deleted in the web library. Account-wide VS Code acce
 - If the extension cannot reach the server when signing out, it clears local credentials and reports that server revocation could not be confirmed. Use web revocation when the server is available.
 
 Report bugs at [GitHub Issues](https://github.com/FunDood155/snippet_manager/issues). Include the extension version and reproduction steps with sensitive details removed.
+
+## License
+
+Snippo is licensed under the [MIT License](https://opensource.org/license/mit). The full license and copyright notice are included in the VSIX.

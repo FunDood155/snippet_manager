@@ -1,6 +1,6 @@
 # Snippo 1.0.0 release gates
 
-WP-02 prepares a local VSIX. The publisher account is managed separately in the Marketplace under `dineshkaarthik`, with intended display name **Dinesh Kaarthik**. Confirm the displayed publisher name in the Marketplace account before a future upload. No project license was found in the tracked files. The owner must select the distribution terms and add the license before a public upload.
+WP-02 prepares a local VSIX. The publisher account is managed separately in the Marketplace under `dineshkaarthik`, with intended display name **Dinesh Kaarthik**. Confirm the displayed publisher name in the Marketplace account before a future upload.
 
 | Area | Observed behavior and release action |
 | --- | --- |
@@ -10,7 +10,7 @@ WP-02 prepares a local VSIX. The publisher account is managed separately in the 
 | Isolation | Flask queries snippets by authenticated owner and the database enforces row-level security with restricted grants. Keep the dedicated database role. Complete a hosted two-account test after deploying the matching backend. |
 | Privacy and deletion | Auth and snippet data are transmitted to the hosted services. Web users can delete snippets. There is no self-service account deletion and no verified retention or deletion policy. Publish an accurate privacy notice and a private support contact. Establish a verified account-deletion process that accounts for owned snippets and backups. The snippet ownership foreign key restricts deletion of an account while snippets remain. |
 | Hosting | The hosted origin must be reachable and serve the updated callback. Supabase Free has finite database, Auth, and transfer allowances and can pause inactive projects. Vercel Hobby is restricted to personal, non-commercial use. Confirm plan eligibility and capacity for the planned distribution. |
-| Marketplace | Check the current publisher agreement, listing and packaging rules, and applicable privacy obligations before manual upload. Confirm support details and license. Custom artwork can be added separately once approved. |
+| Marketplace | Check the current publisher agreement, listing and packaging rules, and applicable privacy obligations before manual upload. Confirm support details. Custom artwork can be added separately once approved. |
 
 References: [VS Code packaging and publishing](https://code.visualstudio.com/api/working-with-extensions/publishing-extension), [Visual Studio Marketplace Publisher Agreement](https://cdn.vsassets.io/v/M187_20210610.3/_content/Visual-Studio-Marketplace-Publisher-Agreement.pdf), [Supabase Auth rate limits](https://supabase.com/docs/guides/auth/rate-limits), [Supabase SMTP](https://supabase.com/docs/guides/auth/auth-smtp), [Supabase pricing](https://supabase.com/pricing), and [Vercel Hobby](https://vercel.com/docs/plans/hobby).
 
@@ -26,7 +26,7 @@ npm run package
 code --install-extension ./snippo-1.0.0.vsix
 ```
 
-Or use **Extensions: Install from VSIX...**. A missing-license warning is expected for this private candidate. Review `npm audit` for build-tool exposure and `npm audit --omit=dev` for distributable dependencies.
+Or use **Extensions: Install from VSIX...**. Review `npm audit` for build-tool exposure and `npm audit --omit=dev` for distributable dependencies.
 
 ## Manual integration and acceptance
 
