@@ -81,9 +81,9 @@ export class AuthClient {
         return trustedOrigin(this.server());
     }
 
-    async configuration(): Promise<SignInRequest> {
+    async configuration(signal?: AbortSignal): Promise<SignInRequest> {
         const origin = this.origin;
-        const response = await this.send(origin + '/oauth/vscode/config');
+        const response = await this.send(origin + '/oauth/vscode/config', { signal });
         if (!response.ok) {
             throw new AuthUnavailable('VS Code sign-in is unavailable on this server.');
         }
@@ -121,6 +121,11 @@ export class AuthClient {
                 throw new SignInRequired();
             }
             await this.save({ origin: attempt.origin, config: attempt.config, tokens });
+            if (signal.aborted || this.origin !== attempt.origin) {
+                await this.storage.delete(credentialKey);
+                await this.revoke(attempt.origin, tokens.access);
+                throw new SignInRequired();
+            }
         });
     }
 

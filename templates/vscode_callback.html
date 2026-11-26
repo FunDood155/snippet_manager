@@ -21,15 +21,17 @@
             {% if authorized %}
                 <p class="description">Open VS Code to finish signing in and return to your workspace.</p>
             {% else %}
-                <p class="description">Return to VS Code to finish this sign-in attempt.</p>
+                <p class="description">Open VS Code to return the cancellation to the editor.</p>
             {% endif %}
+            <p class="description">If your browser or editor does not open automatically, use the button for your editor below.</p>
 
             <div class="actions">
-                <a class="action action--primary" href="vscode://dineshkaarthik.snippo/auth?{{ query }}">Open VS Code</a>
-                <a class="action action--secondary" href="{{ url_for('home') }}">Manage my snippets</a>
+                <a id="open-vscode" class="action action--primary" href="vscode://dineshkaarthik.snippo/auth?{{ query }}">Open VS Code</a>
+                <a class="action action--secondary" href="{{ url_for('home') }}" target="_blank" rel="noopener noreferrer">Manage my snippets (new tab)</a>
             </div>
             <a class="insiders" href="vscode-insiders://dineshkaarthik.snippo/auth?{{ query }}">Open VS Code Insiders</a>
         </section>
     </main>
+    <script src="{{ url_for('static', filename='vscode_callback.js') }}" defer></script>
 </body>
 </html>

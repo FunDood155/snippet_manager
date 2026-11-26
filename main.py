@@ -62,7 +62,7 @@ def create_app(config=None):
             g.owner = auth.api_identity()
         elif request.method == "POST":
             auth.protect_form()
-        if request.endpoint in {"home", "add", "delete"}:
+        if request.endpoint in {"home", "add", "delete", "account_deletion"}:
             g.owner = auth.web_identity()
             if not g.owner:
                 return redirect(url_for("auth.login"), code=303)
@@ -77,7 +77,7 @@ def create_app(config=None):
                 "default-src 'none'; style-src 'self'; form-action 'self'; "
                 "base-uri 'none'; frame-ancestors 'none'"
             )
-            if request.endpoint in {"auth.confirm_email", "auth.reset_password"}:
+            if request.endpoint in {"auth.confirm_email", "auth.reset_password", "auth.vscode_callback"}:
                 response.headers["Content-Security-Policy"] += "; script-src 'self'"
         return response
 
@@ -114,6 +114,10 @@ def create_app(config=None):
             g.owner, request.args.get("search"), request.args.get("category"), include_categories=True,
         )
         return render_template("index.html", snippets=snippets, categories=categories)
+
+    @app.get("/account/deletion")
+    def account_deletion():
+        return render_template("account_deletion.html")
 
     @app.post("/add")
     def add():

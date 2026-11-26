@@ -10,7 +10,7 @@ Snippo connects VS Code Desktop to your private web snippet library. Save a snip
 
 1. Install `snippo-1.0.0.vsix` using **Extensions: Install from VSIX...** in the VS Code Command Palette. This package is a release candidate for private testing.
 2. If you used the previous Code Snippet Manager extension, disable or uninstall it. Snippo has its own secure storage and requires a fresh sign-in. Your server-side snippets stay with your account.
-3. Run **Snippo: Sign In**. Sign in or create an account in the browser, approve access, and select **Open VS Code** or **Open VS Code Insiders** on the callback page.
+3. Run **Snippo: Sign In** and use the browser to sign in and approve access. If you create an account, verify your email and then start **Snippo: Sign In** again. After approval, allow the browser to open VS Code. If it stays on the callback page, choose **Open VS Code** or **Open VS Code Insiders** for the editor you started from.
 4. Add, filter, and delete snippets in the [web library](https://snippet-manager-tan.vercel.app).
 
 The extension needs VS Code Desktop or Insiders compatible with `^1.137.0`, a browser, internet access for hosted use, and a working Snippo backend with Supabase Auth. A maintainer may configure the `snippetManager.serverUrl` user setting for a test backend. Use HTTPS for hosted servers. HTTP is supported on loopback for local development.
@@ -32,7 +32,7 @@ Individual snippets can be deleted in the web library. Account-wide VS Code acce
 - Supabase Auth receives the email address and the application password entered on the website. Supabase manages the password and account. Authentication is required to use the hosted service.
 - Snippet names, categories, code, and account identifiers are stored in PostgreSQL through the Flask service. The extension sends your search text to that service and receives the matching snippets. Avoid storing or pasting API keys, passwords, or other secrets in snippets.
 - The extension stores access and refresh tokens in VS Code SecretStorage. It uses them to authenticate requests and renew its session. The website stores session tokens on the server and uses an opaque browser session cookie. Signing out does not delete your account or your snippets.
-- There is no account self-delete screen. To arrange account and associated data deletion, contact the maintainer through your private testing channel. Do not put your account email, tokens, or snippet content in a public issue. A formal retention and deletion policy remains to be established for public distribution.
+- To request permanent deletion of your account and its owned snippets, use **Request account deletion** in the web library or email [snippo.support@gmail.com](mailto:snippo.support@gmail.com) from the address on your account. Support verifies ownership and asks for explicit consent. Keep passwords, verification links, codes, tokens and snippet contents out of the request.
 
 ## Known limitations
 

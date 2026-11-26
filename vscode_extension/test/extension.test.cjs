@@ -12,10 +12,12 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
     const messages = [];
     const requested = [];
     const picked = [];
+    const progressMessages = [];
     let inserted;
     let handleUri;
     let cancelProgress;
     let openBrowser;
+    let changeConfiguration;
     const disposable = () => ({ dispose() {} });
     class Cancellation {
         token = { isCancellationRequested: false };
@@ -29,13 +31,16 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
         },
         env: {
             uriScheme: 'vscode',
-            openExternal: async uri => { await openBrowser(uri); return true; },
+            openExternal: async uri => (await openBrowser(uri)) ?? true,
         },
         Uri: { parse: value => new URL(value) },
         StatusBarAlignment: { Right: 2 },
         ProgressLocation: { Notification: 3 },
         CancellationTokenSource: Cancellation,
-        workspace: { getConfiguration: () => ({ get: () => origin }), onDidChangeConfiguration: disposable },
+        workspace: {
+            getConfiguration: () => ({ get: () => origin }),
+            onDidChangeConfiguration: listener => { changeConfiguration = listener; return disposable(); },
+        },
         window: {
             createStatusBarItem: () => ({ show() {}, dispose() {} }),
             registerUriHandler: handler => { handleUri = handler.handleUri; return disposable(); },
@@ -61,7 +66,7 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
                     token.isCancellationRequested = true;
                     for (const listener of listeners) { listener(); }
                 };
-                return callback({}, token);
+                return callback({ report: progress => progressMessages.push(progress.message) }, token);
             },
         },
     };
@@ -102,6 +107,46 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
     await run('signIn');
     assert.equal(secret.size, 0);
 
+    openBrowser = async () => false;
+    await run('signIn');
+    assert.match(messages.at(-1), /Could not open/);
+    openBrowser = async () => { throw new Error('Browser unavailable'); };
+    await run('signIn');
+    assert.match(messages.at(-1), /Could not open/);
+
+    openBrowser = async url => {
+        const state = url.searchParams.get('state');
+        handleUri({ scheme: 'vscode', authority: extensionId, path: '/auth', fragment: '',
+            query: 'state=' + state + '&error=access_denied' });
+    };
+    await run('signIn');
+    assert.match(messages.at(-1), /cancelled in the browser/);
+
+    async function launchWhileBrowserIsPending() {
+        let launched;
+        const ready = new Promise(resolve => { launched = resolve; });
+        openBrowser = uri => { launched(uri); return new Promise(() => {}); };
+        const running = run('signIn');
+        return { running, uri: await ready };
+    }
+
+    let pending = await launchWhileBrowserIsPending();
+    await run('signOut');
+    await pending.running;
+    pending = await launchWhileBrowserIsPending();
+    changeConfiguration({ affectsConfiguration: name => name === 'snippetManager.serverUrl' });
+    await pending.running;
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    pending = await launchWhileBrowserIsPending();
+    t.mock.timers.tick(5 * 60_000);
+    await pending.running;
+    t.mock.timers.reset();
+    assert.match(messages.at(-1), /Sign-in expired/);
+    handleUri({ scheme: 'vscode', authority: extensionId, path: '/auth', fragment: '',
+        query: 'state=' + pending.uri.searchParams.get('state') + '&code=late' });
+    assert.equal(secret.size, 0);
+    assert.equal(requested.filter(request => request.pathname.endsWith('/token')).length, 0);
+
     openBrowser = async url => {
         assert.equal(url.origin, config.provider);
         const state = url.searchParams.get('state');
@@ -112,6 +157,8 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
     };
     await run('signIn');
     assert.ok(secret.has(credentialKey));
+    assert.ok(progressMessages.some(message => /return to VS Code/.test(message)));
+    assert.ok(progressMessages.some(message => /Finishing sign-in/.test(message)));
     assert.equal(requested.filter(request => request.pathname.endsWith('/token')).length, 1);
 
     await run('showSnippets');

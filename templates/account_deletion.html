@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Account deletion · Snippo</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<main class="container">
+    <h1>Request account deletion</h1>
+    <section class="card" aria-label="Deletion instructions">
+        <p>To request permanent deletion, email <a href="mailto:snippo.support@gmail.com?subject=Snippo%20account%20deletion">snippo.support@gmail.com</a>
+            from the address associated with your Snippo account.</p>
+        <p>Support will verify that you own the account and ask you to explicitly confirm deletion.
+            Do not send passwords, verification links, codes, tokens, or snippet contents.</p>
+        <p>Deletion permanently removes your account and the snippets it owns. To end your current session and keep your
+            account and snippets, use <strong>Sign out</strong> from your library instead.</p>
+        <p><a href="{{ url_for('home') }}">Back to your snippets</a></p>
+    </section>
+</main>
+</body>
+</html>

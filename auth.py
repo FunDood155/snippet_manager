@@ -12,6 +12,7 @@ import requests
 from flask import (
     Blueprint, abort, current_app, flash, g, jsonify, redirect, render_template, request, session, url_for,
 )
+from werkzeug.exceptions import TooManyRequests
 
 import store
 
@@ -310,8 +311,12 @@ def register():
         except AuthError:
             current_app.logger.warning("Could not revoke an unused registration session")
 
-    flash("If this address can be registered, check your inbox for a verification link.", "registration")
-    return redirect(url_for("auth.login", authorization_id=authorization_id), code=303)
+    return redirect(url_for("auth.verification_pending", authorization_id=authorization_id), code=303)
+
+
+@bp.get("/verification-pending")
+def verification_pending():
+    return auth_page("verification_pending", authorization_id=pending_authorization())
 
 
 def email_provider_path(path, kind):
@@ -324,12 +329,19 @@ def email_provider_path(path, kind):
 def request_email_link():
     recovery = request.endpoint == "auth.forgot_password"
     mode = "forgot" if recovery else "resend"
+    authorization_id = None if recovery else pending_authorization()
     if request.method == "GET":
-        return auth_page(mode)
+        return auth_page(mode, authorization_id=authorization_id)
     email = request.form.get("email", "").strip().lower()
     if not valid_email(email):
-        return auth_page(mode, "Enter a valid email address.", 400)
-    limit("recover" if recovery else "resend", email, 3, 30)
+        return auth_page(mode, "Enter a valid email address.", 400, authorization_id=authorization_id)
+    try:
+        limit("recover" if recovery else "resend", email, 3, 30)
+    except TooManyRequests:
+        if recovery:
+            raise
+        return auth_page(mode, "Too many attempts. Wait a few minutes before requesting another link.", 429,
+                         authorization_id=authorization_id)
     kind = "recovery" if recovery else "signup"
     body = {"email": email} if recovery else {"email": email, "type": "signup"}
     try:
@@ -338,6 +350,8 @@ def request_email_link():
         # Provider responses can differ by account existence or email quota.
         if exc.status not in (400, 404, 422, 429):
             raise
+    if not recovery:
+        return redirect(url_for("auth.verification_pending", authorization_id=authorization_id), code=303)
     flash("If this address is eligible, check your inbox for the link. Allow a few minutes for delivery.", "registration")
     return redirect(url_for("auth.login"), code=303)
 

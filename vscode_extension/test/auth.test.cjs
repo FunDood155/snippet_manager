@@ -84,6 +84,29 @@ test('checks server origin, redirect and HTTPS requirements', async () => {
     }
 });
 
+test('cancellation while saving credentials clears the just-created session', async () => {
+    const controller = new AbortController();
+    const secrets = storage();
+    const save = secrets.store;
+    secrets.store = async (key, value) => {
+        controller.abort();
+        await save(key, value);
+    };
+    let revoked = false;
+    const auth = new AuthClient(secrets, () => origin, async (url, init) => {
+        if (new URL(url).pathname.endsWith('/token')) {
+            return tokens('access', 'refresh');
+        }
+        assert.equal(url, origin + '/api/logout');
+        assert.equal(init.headers.Authorization, 'Bearer access');
+        revoked = true;
+        return new Response(null, { status: 204 });
+    });
+    await assert.rejects(auth.complete(new SignInRequest(config, origin), 'code', controller.signal), SignInRequired);
+    assert.equal(await auth.hasSession(), false);
+    assert.equal(revoked, true);
+});
+
 test('exchanges once, persists across restart, serializes refresh, and revokes on sign-out', async () => {
     const secrets = storage();
     const requests = [];

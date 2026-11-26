@@ -239,15 +239,20 @@ class AppTest(unittest.TestCase):
             "name": "shared name", "cat": "sample", "code": "test code", **overrides,
         })
 
-    def test_registration_redirects_to_login_and_provisions_starters_once(self):
+    def test_registration_shows_verification_instructions_and_provisions_starters_once(self):
         email = "new@sample.test"
         password = "testpass"
         first = self.form("/register", email=email, password=password)
         duplicate = self.form("/register", email=email.upper(), password="other-password")
-        self.assertEqual((first.status_code, first.location), (303, "/login"))
-        self.assertEqual((duplicate.status_code, duplicate.location), (303, "/login"))
+        self.assertEqual((first.status_code, first.location), (303, "/verification-pending"))
+        self.assertEqual((duplicate.status_code, duplicate.location), (303, first.location))
         self.assertEqual(first.data, duplicate.data)
-        self.assertIn(b"check your inbox", self.browser.get("/login").data)
+        for browser in (self.browser, self.app.test_client()):
+            notice = browser.get(first.location)
+            for copy in (b"<h1>Check your email</h1>", b"inbox and Spam", b"Continue", b"Resend confirmation",
+                         b'href="/login"', b"Wait a few minutes"):
+                self.assertIn(copy, notice.data)
+            self.assertNotIn(email.encode(), notice.data)
         owner = auth.provider.pending[email]
         self.assertEqual(store.list_snippets(owner)[0], [])
         pending_token = fake_jwt(owner, str(uuid4()))
@@ -369,11 +374,15 @@ class AppTest(unittest.TestCase):
 
     def test_resend_recovery_rate_limits_and_provider_failures(self):
         for path in ("/resend-confirmation", "/forgot-password"):
+            expected = "/verification-pending" if path == "/resend-confirmation" else "/login"
             for _ in range(3):
-                self.assertEqual(self.form(path, email="unknown@sample.test").location, "/login")
-            self.assertEqual(self.form(path, email="unknown@sample.test").status_code, 429)
+                self.assertEqual(self.form(path, email="unknown@sample.test").location, expected)
+            limited = self.form(path, email="unknown@sample.test")
+            self.assertEqual(limited.status_code, 429)
+            if path == "/resend-confirmation":
+                self.assertIn(b"Wait a few minutes before requesting another link", limited.data)
             with patch("auth.provider", side_effect=auth.AuthError(429)):
-                self.assertEqual(self.form(path, email="b@sample.test").location, "/login")
+                self.assertEqual(self.form(path, email="b@sample.test").location, expected)
             with patch("auth.provider", side_effect=auth.AuthError(503)):
                 self.assertEqual(self.form(path, email="b@sample.test").status_code, 503)
         auth.provider.autoconfirm = True
@@ -401,10 +410,50 @@ class AppTest(unittest.TestCase):
     def test_registration_preserves_vscode_authorization_request(self):
         path = "/register?authorization_id=" + ATTEMPT
         notice = self.form(path, email="vscode@sample.test", password=PASSWORD)
-        self.assertEqual(notice.location, "/login?authorization_id=" + ATTEMPT)
+        self.assertEqual(notice.location, "/verification-pending?authorization_id=" + ATTEMPT)
+        pending = self.browser.get(notice.location)
+        signin_path = "/login?authorization_id=" + ATTEMPT
+        resend_path = "/resend-confirmation?authorization_id=" + ATTEMPT
+        self.assertIn(signin_path.encode(), pending.data)
+        self.assertIn(resend_path.encode(), pending.data)
+        self.assertIn(b"start sign-in again from VS Code", pending.data)
+        self.assertEqual(self.browser.post(resend_path, data={"email": "vscode@sample.test"}).status_code, 400)
+        self.assertEqual(self.form(resend_path, email="vscode@sample.test").location, notice.location)
         self.verify_email_token("signup", "vscode@sample.test")
-        signin = self.form(notice.location, email="vscode@sample.test", password=PASSWORD)
+        self.assertIn(b"start its sign-in again", self.browser.get("/login").data)
+        signin = self.form(signin_path, email="vscode@sample.test", password=PASSWORD)
         self.assertEqual(signin.location, "/oauth/consent?authorization_id=" + ATTEMPT)
+
+    def test_account_deletion_instructions_require_sign_in_and_only_offer_support(self):
+        path = "/account/deletion"
+        self.assertEqual(self.browser.get(path).location, "/login")
+        self.login()
+        self.assertIn(f'href="{path}"'.encode(), self.browser.get("/").data)
+        instructions = self.browser.get(path)
+        self.assertEqual(instructions.status_code, 200)
+        for copy in (b"mailto:snippo.support@gmail.com", b"explicitly confirm deletion", b"snippets it owns"):
+            self.assertIn(copy, instructions.data)
+        self.assertNotIn(b"<form", instructions.data)
+        self.assertEqual(self.browser.post(path, data={"csrf_token": csrf(self.browser, "/")}).status_code, 405)
+
+    def test_deletion_schema_requires_targeted_snippet_cleanup(self):
+        owner = self.create_account(confirmed=True)
+        other = store.add_snippet(A, "Keep", "Fixture", "print(1)")
+        with self.assertRaises(psycopg2.errors.ForeignKeyViolation):
+            self.auth_sql("DELETE FROM auth.users WHERE id = %s", (owner,))
+        with store.cursor() as cur:
+            cur.execute("INSERT INTO snippet_private.session_cutoffs VALUES (%s, 0)", (owner,))
+        with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM public.snippets WHERE owner_id = %s", (owner,))
+            self.assertEqual(cur.rowcount, len(STARTERS))
+        # Exercise only the database constraints in the disposable fixture.
+        self.auth_sql("DELETE FROM auth.users WHERE id = %s", (owner,))
+        with store.cursor() as cur:
+            cur.execute("SELECT count(*) FROM snippet_private.session_cutoffs WHERE user_id = %s", (owner,))
+            self.assertEqual(cur.fetchone(), (0,))
+        with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM public.snippets WHERE sno IN (%s, %s)", (other, LEGACY[0]))
+            self.assertEqual(cur.fetchone(), (2,))
 
     def test_rate_limit_is_shared_across_clients(self):
         for _ in range(8):
@@ -523,7 +572,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.browser.get("/api/session", headers=self.api_a).status_code, 401)
         self.assertEqual(self.browser.get("/api/session", headers=self.api_b).status_code, 200)
 
-    def test_callback_success_and_decline_keep_manual_handoff(self):
+    def test_callback_success_and_decline_enable_handoff_with_manual_fallbacks(self):
         state = "a" * 43
         for parameters, heading, payload in (
             ({"code": "test-code"}, b"Authorization successful", "code=test-code"),
@@ -536,14 +585,20 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(response.headers["Cache-Control"], "no-store")
                 self.assertIn(heading, response.data)
                 self.assertIn(b"Snippo", response.data)
-                self.assertIn(b'href="/"', response.data)
+                self.assertIn(b'href="/" target="_blank" rel="noopener noreferrer"', response.data)
                 self.assertIn(b"Manage my snippets", response.data)
                 self.assertIn(b"/static/vscode_callback.css", response.data)
-                self.assertNotIn(b"<script", response.data)
+                self.assertIn(b'<script src="/static/vscode_callback.js" defer>', response.data)
+                self.assertIn("script-src 'self'", response.headers["Content-Security-Policy"])
+                self.assertIn(b'id="open-vscode"', response.data)
                 self.assertIsNone(response.headers.get("Location"))
                 for scheme in ("vscode", "vscode-insiders"):
                     uri = f'{scheme}://dineshkaarthik.snippo/auth?state={state}&amp;{payload}'
                     self.assertIn(uri.encode(), response.data)
+        self.assertNotIn("script-src", self.browser.get("/login").headers["Content-Security-Policy"])
+        invalid = self.browser.get(auth.CALLBACK_PATH, query_string={"state": "bogus", "code": "test"})
+        self.assertEqual(invalid.status_code, 400)
+        self.assertNotIn(b"/static/vscode_callback.js", invalid.data)
 
     def test_db_rls_and_revoked_api_acl(self):
         row_id = store.add_snippet(A, "SQL fixture", "rls", "fixture")

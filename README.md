@@ -612,6 +612,16 @@ VS Code Extension
 Cloud Deployment
 ```
 
+## Account deletion
+
+Choose **Request account deletion** in your web library or email
+[snippo.support@gmail.com](mailto:snippo.support@gmail.com) from the address on your account.
+Support verifies account ownership and asks for explicit consent before permanently deleting
+the account and its owned snippets. Keep passwords, verification links, tokens, codes and
+snippet contents out of the request. Use **Sign out** to end a session and keep your library.
+
+Maintainers can follow the [account deletion runbook](docs/account-deletion.md).
+
 ## License
 
 Snippo is licensed under the [MIT License](LICENSE).

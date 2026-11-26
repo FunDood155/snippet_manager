@@ -12,7 +12,8 @@
                      "consent": "Connect VS Code", "revoked": "VS Code access revoked",
                      "forgot": "Forgot password", "resend": "Resend confirmation",
                      "confirm_link": "Verify your email", "recovery_link": "Confirm password recovery",
-                     "reset": "Choose a new password", "invalid_link": "Email link unavailable"} %}
+                     "reset": "Choose a new password", "invalid_link": "Email link unavailable",
+                     "verification_pending": "Check your email"} %}
     <h1>{{ titles[mode] }}</h1>
     <div class="card">
         {% if mode == "revoked" %}
@@ -21,6 +22,19 @@
         {% elif mode == "invalid_link" %}
         <p role="alert">This link is invalid, expired, or already used. Request a new email to continue.</p>
         <p><a href="{{ url_for('auth.resend_confirmation') }}">Resend confirmation</a> · <a href="{{ url_for('auth.forgot_password') }}">Reset password</a></p>
+        {% elif mode == "verification_pending" %}
+        <p>If a verification link is available for this address, it can take a few minutes to arrive.</p>
+        <ol>
+            <li>Check your inbox and Spam folder for a Snippo verification email.</li>
+            <li>Open the link and select <strong>Continue</strong> to verify your email.</li>
+            <li>Sign in after verifying your email. If you already verified it, you can sign in now.</li>
+        </ol>
+        {% if authorization_id %}
+        <p>After verification, start sign-in again from VS Code. Your original attempt may expire while you check your email.</p>
+        {% endif %}
+        <p>Wait a few minutes before requesting another link.</p>
+        <p><a href="{{ url_for('auth.resend_confirmation', authorization_id=authorization_id) }}">Resend confirmation</a> ·
+            <a href="{{ url_for('auth.login', authorization_id=authorization_id) }}">Sign in</a></p>
         {% else %}
         {% if error %}<p role="alert">{{ error }}</p>{% endif %}
         {% for message in get_flashed_messages(category_filter=["registration"]) %}
@@ -67,7 +81,7 @@
         </form>
         {% if mode == "login" %}
         <p><a href="{{ url_for('auth.register', authorization_id=authorization_id) }}">Create an account</a></p>
-        <p><a href="{{ url_for('auth.resend_confirmation') }}">Resend confirmation</a> · <a href="{{ url_for('auth.forgot_password') }}">Forgot password?</a></p>
+        <p><a href="{{ url_for('auth.resend_confirmation', authorization_id=authorization_id) }}">Resend confirmation</a> · <a href="{{ url_for('auth.forgot_password') }}">Forgot password?</a></p>
         {% elif mode in ("register", "forgot", "resend") %}
         <p><a href="{{ url_for('auth.login', authorization_id=authorization_id) }}">Sign in</a></p>
         {% endif %}

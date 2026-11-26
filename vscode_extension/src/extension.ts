@@ -6,6 +6,7 @@ const configuration = () => vscode.workspace.getConfiguration('snippetManager');
 const server = () => configuration().get<string>('serverUrl', '');
 
 type Snippet = { name: string; cat: string; code: string };
+type BrowserResult = { code: string } | 'declined' | 'expired' | 'cancelled' | 'launch-failed';
 
 export function activate(context: vscode.ExtensionContext) {
     const auth = new AuthClient(context.secrets, server);
@@ -41,76 +42,92 @@ export function activate(context: vscode.ExtensionContext) {
         }));
     }
 
-    function receive(attempt: SignInRequest, token: vscode.CancellationToken): Promise<string | null> {
+    function receive(attempt: SignInRequest, signal: AbortSignal): Promise<BrowserResult> {
         return new Promise((resolve) => {
-            const finish = (code: string | null) => {
+            const finish = (result: BrowserResult) => {
                 callback = undefined;
                 clearTimeout(timer);
-                subscription.dispose();
-                resolve(code);
+                signal.removeEventListener('abort', cancel);
+                resolve(result);
             };
-            const timer = setTimeout(() => finish(null), Math.max(0, attempt.expires - Date.now()));
-            const subscription = token.onCancellationRequested(() => finish(null));
+            const cancel = () => finish('cancelled');
+            const timer = setTimeout(() => finish('expired'), Math.max(0, attempt.expires - Date.now()));
             callback = (uri) => {
                 const code = attempt.accept(uri, vscode.env.uriScheme);
                 if (code !== undefined) {
-                    finish(code);
+                    finish(code === null ? 'declined' : { code });
                 }
             };
-            stopSignIn = () => finish(null);
-            if (token.isCancellationRequested) {
-                finish(null);
+            signal.addEventListener('abort', cancel, { once: true });
+            if (signal.aborted) {
+                cancel();
             }
         });
     }
 
     register('signIn', async () => {
-        if (stopSignIn || await auth.hasSession() || stopSignIn) {
+        const initialGeneration = generation;
+        if (stopSignIn || await auth.hasSession() || stopSignIn || initialGeneration !== generation) {
             return;
         }
         const controller = new AbortController();
         stopSignIn = () => controller.abort();
-        const initialGeneration = generation;
+        const signal = controller.signal;
         try {
             await vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
                 title: 'Signing in to Snippo',
                 cancellable: true,
-            }, async (_progress, token) => {
+            }, async (progress, token) => {
                 const subscription = token.onCancellationRequested(() => controller.abort());
                 try {
-                    const attempt = await auth.configuration();
-                    if (controller.signal.aborted || initialGeneration !== generation || token.isCancellationRequested) {
+                    if (token.isCancellationRequested) {
                         return;
                     }
-                    const received = receive(attempt, token);
-                    if (!await vscode.env.openExternal(vscode.Uri.parse(attempt.url.toString()))) {
-                        stopSignIn?.();
-                        void vscode.window.showErrorMessage('Could not open the sign-in page in your browser.');
+                    const attempt = await auth.configuration(signal);
+                    if (signal.aborted) {
                         return;
                     }
-                    const code = await received;
-                    stopSignIn = () => controller.abort();
-                    if (code && !token.isCancellationRequested && initialGeneration === generation) {
-                        try {
-                            await auth.complete(attempt, code, controller.signal);
-                        } catch (error) {
-                            if (!controller.signal.aborted) {
-                                throw error;
+                    progress.report({ message: 'Continue in your browser, then return to VS Code.' });
+                    const received = receive(attempt, signal);
+                    const launchFailure = new Promise<'launch-failed'>(resolve => {
+                        void Promise.resolve().then(() => {
+                            if (!signal.aborted) {
+                                return vscode.env.openExternal(vscode.Uri.parse(attempt.url.toString()));
                             }
-                        }
-                        if (!controller.signal.aborted) {
+                        }).then(opened => {
+                            if (!opened) {
+                                resolve('launch-failed');
+                            }
+                        }, () => resolve('launch-failed'));
+                    });
+                    const result = await Promise.race([received, launchFailure]);
+                    if (signal.aborted) {
+                        return;
+                    }
+                    if (result === 'launch-failed') {
+                        void vscode.window.showErrorMessage('Could not open the sign-in page in your browser.');
+                    } else if (result === 'declined') {
+                        void vscode.window.showInformationMessage('Sign-in was cancelled in the browser. You can start again.');
+                    } else if (result === 'expired') {
+                        void vscode.window.showInformationMessage('Sign-in expired. Start sign-in again from VS Code.');
+                    } else if (typeof result === 'object') {
+                        progress.report({ message: 'Finishing sign-in in VS Code…' });
+                        await auth.complete(attempt, result.code, signal);
+                        if (!signal.aborted) {
                             void vscode.window.showInformationMessage('Signed in to Snippo.');
                         }
-                    } else if (!token.isCancellationRequested && initialGeneration === generation) {
-                        void vscode.window.showInformationMessage('Sign-in was declined or expired. You can start again.');
+                    }
+                } catch (error) {
+                    if (!signal.aborted) {
+                        throw error;
                     }
                 } finally {
                     subscription.dispose();
                 }
             });
         } finally {
-            stopSignIn?.();
+            controller.abort();
             stopSignIn = undefined;
             await updateStatus();
         }
