@@ -6,6 +6,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from html import unescape
 from pathlib import Path
 from unittest.mock import patch
 from threading import Barrier
@@ -38,6 +39,7 @@ MIGRATION = next((ROOT / "supabase/migrations").glob("*_snippet_ownership.sql"))
 STARTER_MIGRATION = next((ROOT / "supabase/migrations").glob("*_default_starter_snippets.sql")).read_text()
 PUBLIC_AUTH = next((ROOT / "supabase/migrations").glob("*_public_authentication.sql")).read_text()
 SHARED_DEFAULTS = next((ROOT / "supabase/migrations").glob("*_shared_default_snippets.sql")).read_text()
+FAVORITES_EDIT = next((ROOT / "supabase/migrations").glob("*_snippet_favorites_and_editing.sql")).read_text()
 HIDDEN_DEFAULTS = next((ROOT / "supabase/migrations").glob("*_hidden_default_snippets.sql")).read_text()
 RETIRE_STARTERS = next((ROOT / "supabase/migrations").glob("*_retire_starter_copies.sql")).read_text()
 PUBLIC_UNDO = (ROOT / "supabase/rollback_public_authentication.sql").read_text()
@@ -208,6 +210,7 @@ class AppTest(unittest.TestCase):
                 cur.execute(PUBLIC_AUTH)
                 cur.execute(SHARED_DEFAULTS)
                 cur.execute(HIDDEN_DEFAULTS)
+                cur.execute(FAVORITES_EDIT)
                 cur.execute("DELETE FROM snippet_private.legacy_email_holds WHERE user_id IN (%s, %s)", (A, B))
                 cur.execute("ALTER ROLE snippet_app LOGIN PASSWORD 'fixture-only'")
 
@@ -216,6 +219,7 @@ class AppTest(unittest.TestCase):
             with conn, conn.cursor() as cur:
                 cur.execute("DELETE FROM public.snippets WHERE owner_id IS NOT NULL")
                 cur.execute("DELETE FROM snippet_private.hidden_default_snippets")
+                cur.execute("DELETE FROM snippet_private.favorite_default_snippets")
                 cur.execute("""TRUNCATE snippet_private.web_sessions, snippet_private.auth_limits,
                     snippet_private.revoked_vscode_sessions, snippet_private.session_cutoffs, snippet_private.email_flows""")
         patches = (patch.dict(os.environ, {"SNIPPET_DATABASE_URL": self.runtime}),
@@ -856,6 +860,137 @@ class AppTest(unittest.TestCase):
         signed_out = self.browser.post("/logout", data=form, follow_redirects=True)
         self.assertIn(b"Signed out of Snippo.", signed_out.data)
 
+    def test_edit_and_duplicate_keep_source_code_and_owner_boundaries(self):
+        raw = "\r\n\tprint('<tag>')  \r\n\n"
+        source = self.api_create(self.api_a, name="Source", cat="Python", code=raw).json["sno"]
+        foreign = self.api_create(self.api_b, name="Other owner").json["sno"]
+        shared = store.DEFAULT_ID_MIN
+        self.login()
+        token = csrf(self.browser, "/")
+        form = {"csrf_token": token, "name": "Renamed", "cat": "Python", "code": raw.replace("\r\n", "\n"),
+                "owner_id": B, "sno": foreign}
+        self.assertEqual(self.browser.post(f"/edit/{source}", data={"name": "No CSRF"}).status_code, 400)
+        for sno in (foreign, shared, 2147483648):
+            self.assertEqual(self.browser.post(f"/edit/{sno}", data=form).status_code, 404)
+        self.assertEqual(self.browser.get(f"/duplicate/{foreign}").status_code, 404)
+        self.assertEqual(self.browser.post(f"/duplicate/{foreign}", data=form).status_code, 404)
+        self.assertIn(b'value="Source"', self.browser.get(f"/edit/{source}").data)
+        self.assertIn(b'value="Source (copy)"', self.browser.get(f"/duplicate/{source}").data)
+        self.assertIn(b'value="Hello World (copy)"', self.browser.get(f"/duplicate/{shared}").data)
+        self.assertEqual(len(self.personal_snippets(A)), 1)
+        invalid = self.browser.post(f"/edit/{source}", data={**form, "cat": " "})
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn(b'value="Renamed"', invalid.data)
+        self.assertIn(f'/edit/{source}'.encode(), invalid.data)
+        with patch("store.edit_snippet", side_effect=psycopg2.OperationalError("private connection details")):
+            failed = self.browser.post(f"/edit/{source}", data=form)
+        self.assertEqual(failed.status_code, 503)
+        self.assertIn(b'value="Renamed"', failed.data)
+        self.assertNotIn(b"private connection details", failed.data)
+        self.assertNotIn(b"Snippet updated.", failed.data)
+        self.assertIn(b"Snippet updated.", self.browser.post(f"/edit/{source}", data=form, follow_redirects=True).data)
+        row = self.browser.get(f"/api/snippets/{source}", headers=self.api_a).json
+        self.assertEqual(row, {"sno": source, "name": "Renamed", "cat": "Python", "code": raw})
+        self.assertEqual(self.browser.get(f"/api/snippets/{source}", headers=self.api_b).status_code, 404)
+        duplicate = self.browser.post(f"/duplicate/{source}", data=form, follow_redirects=True)
+        self.assertIn(b"Snippet duplicated.", duplicate.data)
+        rows = self.personal_snippets(A)
+        self.assertEqual([row[1:] for row in rows], [("Renamed", "Python", raw)] * 2)
+        self.assertEqual(rows[0][0], source)
+        self.assertNotEqual(rows[1][0], source)
+        self.assertTrue(store.hide_default(A, shared))
+        self.assertEqual(self.browser.get(f"/duplicate/{shared}").status_code, 404)
+        self.assertEqual(self.browser.post(f"/duplicate/{shared}", data=form).status_code, 404)
+
+    def test_favorites_combine_with_filters_and_preserve_hidden_state(self):
+        older = self.api_create(self.api_a, name="Zebra", cat="Basics", code="match").json["sno"]
+        newer = self.api_create(self.api_a, name="Alpha", cat="Basics", code="match").json["sno"]
+        foreign = self.api_create(self.api_b, name="Other owner", cat="Basics").json["sno"]
+        shared = store.DEFAULT_ID_MIN
+        self.login()
+        token = csrf(self.browser, "/")
+        favorite = {"csrf_token": token, "action": "add", "user_id": B}
+        for sno in (older, newer, shared, older):
+            self.assertEqual(self.browser.post(f"/favorites/{sno}", data=favorite).status_code, 303)
+        self.assertEqual(self.browser.post(f"/favorites/{foreign}", data=favorite).status_code, 404)
+        self.assertEqual(self.browser.post("/favorites/2147483648", data=favorite).status_code, 404)
+        self.assertEqual(self.browser.post(f"/favorites/{older}").status_code, 400)
+        self.assertEqual(self.browser.post(f"/favorites/{older}", data={**favorite, "action": "wrong"}).status_code, 400)
+        for order, expected in (("default", [older, newer]), ("name", [newer, older]),
+                                ("newest", [newer, older]), ("oldest", [older, newer])):
+            rows, _ = store.list_snippets(A, "match", "Basics", scope="favorites", sort=order)
+            self.assertEqual([row[0] for row in rows], expected)
+        page = self.browser.get("/?scope=favorites&search=match&category=Basics&sort=newest")
+        self.assertIn(b"2 snippets", page.data)
+        self.assertLess(page.data.index(b"<h2>Alpha"), page.data.index(b"<h2>Zebra"))
+        self.assertIn(b"Insertion order within personal and shared snippets.", page.data)
+        self.assertEqual(store.list_snippets(B, scope="favorites")[0], [])
+        self.assertTrue(store.hide_default(A, shared))
+        self.assertNotIn(b"<h2>Hello World", self.browser.get("/?scope=favorites").data)
+        self.assertTrue(store.restore_default(A, shared))
+        self.assertIn(b"<h2>Hello World", self.browser.get("/?scope=favorites").data)
+        self.assertEqual(store.list_snippets(A, scope="favorites")[0][-1][0], shared)
+        self.assertEqual(self.browser.post(f"/favorites/{older}", data={**favorite, "action": "remove"}).status_code, 303)
+        self.assertTrue(store.delete_snippet(A, newer))
+        self.assertEqual([row[0] for row in store.list_snippets(A, scope="favorites")[0]], [shared])
+        api_rows = self.browser.get("/api/snippets?scope=favorites&sort=name", headers=self.api_a).json
+        self.assertEqual(len(api_rows), 5)
+        self.assertTrue(all(set(item) == {"sno", "name", "cat", "code"} for item in api_rows))
+
+    def test_favorites_and_edit_database_privileges(self):
+        personal = store.add_snippet(A, "Personal", "Fixture", "owner code")
+        shared = store.DEFAULT_ID_MIN
+        self.assertTrue(store.set_favorite(A, personal, True))
+        with store.cursor(B) as cur:
+            cur.execute("UPDATE public.snippets SET code = 'wrong' WHERE sno = %s", (personal,))
+            self.assertEqual(cur.rowcount, 0)
+            cur.execute("SELECT * FROM snippet_private.favorite_personal_snippets")
+            self.assertFalse(cur.fetchall())
+            with self.assertRaises(psycopg2.errors.ForeignKeyViolation):
+                cur.execute("INSERT INTO snippet_private.favorite_personal_snippets VALUES (%s, %s)", (B, personal))
+        with store.cursor(B) as cur:
+            with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+                cur.execute("INSERT INTO snippet_private.favorite_default_snippets VALUES (%s, %s)", (A, shared))
+        with store.cursor(A) as cur:
+            with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+                cur.execute("UPDATE public.snippets SET owner_id = %s WHERE sno = %s", (B, personal))
+        with closing(psycopg2.connect(self.admin)) as conn, conn.cursor() as cur:
+            cur.execute("SELECT has_column_privilege('snippet_app', 'public.snippets', 'sno', 'UPDATE'), "
+                        "has_table_privilege('snippet_app', 'public.default_snippets', 'UPDATE')")
+            self.assertEqual(cur.fetchone(), (False, False))
+            for role in ("anon", "authenticated", "service_role"):
+                cur.execute("SELECT has_table_privilege(%s, 'snippet_private.favorite_default_snippets', 'SELECT'), "
+                            "has_table_privilege(%s, 'snippet_private.favorite_personal_snippets', 'SELECT')",
+                            (role, role))
+                self.assertEqual(cur.fetchone(), (False, False))
+            cur.execute("INSERT INTO snippet_private.favorite_default_snippets VALUES (%s, %s)", (B, shared))
+            cur.execute("DELETE FROM public.default_snippets WHERE sno = %s", (shared,))
+            cur.execute("SELECT count(*) FROM snippet_private.favorite_default_snippets")
+            self.assertEqual(cur.fetchone(), (0,))
+            cur.execute("SELECT count(*) FROM snippet_private.favorite_personal_snippets")
+            self.assertEqual(cur.fetchone(), (1,))
+            user = str(uuid4())
+            cur.execute("INSERT INTO auth.users (id) VALUES (%s)", (user,))
+            cur.execute("INSERT INTO snippet_private.favorite_default_snippets VALUES (%s, %s)", (user, shared + 1))
+            cur.execute("DELETE FROM auth.users WHERE id = %s", (user,))
+            cur.execute("SELECT count(*) FROM snippet_private.favorite_default_snippets")
+            self.assertEqual(cur.fetchone(), (0,))
+            conn.rollback()
+
+    def test_highlighting_is_escaped_and_copy_data_round_trips(self):
+        code = "  <img src=x onerror=alert(1)>\r\n<script>alert(1)</script>  \n"
+        self.api_create(self.api_a, name="HTML sample", cat="HTML", code=code)
+        self.api_create(self.api_a, name="Text sample", cat="Misc", code="literal <tag>")
+        self.login()
+        highlighted = self.browser.get("/?search=HTML+sample").get_data(as_text=True)
+        self.assertNotIn("<script>alert(1)</script>", highlighted)
+        self.assertNotIn("<img src=x", highlighted)
+        self.assertIn("syntax-name", highlighted)
+        data_copy = re.search(r'data-copy="([^"]*)"', highlighted)[1]
+        self.assertEqual(json.loads(unescape(data_copy)), code)
+        plain = self.browser.get("/?search=Text+sample").get_data(as_text=True)
+        self.assertIn("<code>literal &lt;tag&gt;</code>", plain)
+
     def test_preference_rls_grants_and_fk_cascade(self):
         table = "snippet_private.hidden_default_snippets"
         self.assertTrue(store.hide_default(A, store.DEFAULT_ID_MIN))
@@ -1085,6 +1220,10 @@ class AppTest(unittest.TestCase):
         ownership_rollback = UNDO.strip().removeprefix("BEGIN;").removesuffix("COMMIT;")
         public_rollback = PUBLIC_UNDO.split("BEGIN;", 1)[1].removesuffix("COMMIT;\n")
         rollback_body = (
+            "DROP TABLE snippet_private.favorite_personal_snippets, snippet_private.favorite_default_snippets;"
+            "ALTER TABLE public.snippets DROP CONSTRAINT snippets_owner_sno_key;"
+            "DROP POLICY snippets_update_owned ON public.snippets;"
+            "REVOKE UPDATE (name, cat, code) ON public.snippets FROM snippet_app;"
             "DROP TABLE snippet_private.hidden_default_snippets;"
             "DROP TABLE public.default_snippets;"
             "ALTER TABLE public.snippets DROP CONSTRAINT snippets_personal_id_range;"

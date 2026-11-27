@@ -238,7 +238,7 @@ def revoke_vscode_grant():
             flash("All VS Code sessions revoked.", "library-success")
     if dashboard:
         return redirect(url_for("home", search=request.args.get("search"), category=request.args.get("category"),
-                                scope=request.args.get("scope")), code=303)
+                                scope=request.args.get("scope"), sort=request.args.get("sort")), code=303)
     return render_template("auth.html", mode="revoked")
 
 

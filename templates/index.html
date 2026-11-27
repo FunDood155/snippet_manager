@@ -3,9 +3,10 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
+    <meta name="color-scheme" content="dark light">
     <title>Snippo · Snippet Library</title>
     <link rel="icon" href="{{ url_for('static', filename='images/snippo.png') }}">
+    <script src="{{ url_for('static', filename='dashboard-theme.js') }}"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
     <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>
 </head>
@@ -39,6 +40,11 @@
                 <span class="chevron" aria-hidden="true"></span>
             </summary>
             <div class="menu-panel">
+                <fieldset class="theme-options" hidden>
+                    <legend>Theme</legend>
+                    <label><input type="radio" name="theme" value="dark" checked> Dark</label>
+                    <label><input type="radio" name="theme" value="light"> Light</label>
+                </fieldset>
                 <form method="post" action="{{ url_for('auth.logout') }}">
                     {{ form_token() }}
                     <input type="hidden" name="dashboard" value="1">
@@ -53,8 +59,12 @@
         <section class="library-heading" aria-labelledby="library-title">
             <h1 id="library-title">Snippet Library</h1>
             <details class="composer" {% if draft is not none %}open{% endif %}>
-                <summary class="primary"><span aria-hidden="true">+</span> New snippet</summary>
-                <form method="post" action="{{ url_for('add', **selection) }}" class="composer-form">
+                <summary class="primary">
+                    {% if editor == 'edit' %}Edit snippet{% elif editor == 'duplicate' %}Duplicate snippet{% else %}
+                        <span aria-hidden="true">+</span> New snippet
+                    {% endif %}
+                </summary>
+                <form method="post" action="{{ url_for(editor, sno=source_id, **selection) }}" class="composer-form">
                     {{ form_token() }}
                     <div class="fields">
                         <label>Snippet name
@@ -68,7 +78,11 @@
                         <textarea name="code" rows="5" required>{{ '\n' }}{{ draft.get('code', '') if draft is not none else '' }}</textarea>
                     </label>
                     <div class="form-actions">
-                        <button class="quiet" type="button" data-close hidden>Cancel</button>
+                        {% if editor == 'add' %}
+                            <button class="quiet" type="button" data-close hidden>Cancel</button>
+                        {% else %}
+                            <a class="quiet action-link" href="{{ url_for('home', **selection) }}">Cancel</a>
+                        {% endif %}
                         <button class="primary" type="submit">Save snippet</button>
                     </div>
                 </form>
@@ -77,6 +91,7 @@
 
         <form class="filters" method="get" action="{{ url_for('home') }}" aria-label="Search and category filters">
             {% if selection.scope != 'all' %}<input type="hidden" name="scope" value="{{ selection.scope }}">{% endif %}
+            {% if selection.get("sort") %}<input type="hidden" name="sort" value="{{ selection.sort }}">{% endif %}
             <label class="search">
                 <span class="sr-only">Search snippets</span>
                 <span class="search-symbol" aria-hidden="true"></span>
@@ -99,15 +114,35 @@
 
         <div class="toolbar">
             <nav class="scopes" aria-label="Snippet type">
-                {% for scope, label in [('all', 'All snippets'), ('personal', 'Personal'), ('defaults', 'Defaults')] %}
-                    <a href="{{ url_for('home', scope=scope, search=selection.search, category=selection.category) }}"
+                {% for scope, label in [('all', 'All snippets'), ('personal', 'Personal'), ('defaults', 'Defaults'), ('favorites', 'Favorites')] %}
+                    <a href="{{ url_for('home', scope=scope, search=selection.search, category=selection.category, sort=selection.get('sort')) }}"
                        {% if selection.scope == scope %}aria-current="page"{% endif %}>{{ label }}</a>
                 {% endfor %}
             </nav>
-            {% if selection.search or selection.category or selection.scope != 'all' %}
-                <a class="clear-filters" href="{{ url_for('home') }}">Clear filters</a>
-            {% endif %}
+            <div class="results-controls">
+                {% if not unavailable %}
+                    <span class="results-count">{{ snippets|length }} {{ 'snippet' if snippets|length == 1 else 'snippets' }}</span>
+                {% endif %}
+                <form method="get" action="{{ url_for('home') }}" class="sort-form">
+                    <input type="hidden" name="search" value="{{ selection.search }}">
+                    <input type="hidden" name="category" value="{{ selection.category }}">
+                    <input type="hidden" name="scope" value="{{ selection.scope }}">
+                    <label class="sr-only" for="snippet-sort">Sort snippets</label>
+                    <select id="snippet-sort" name="sort">
+                        {% for value, label in [('default', 'Default order'), ('name', 'Name A–Z'), ('newest', 'Newest in each group'), ('oldest', 'Oldest in each group')] %}
+                            <option value="{{ value }}" {% if selection.get('sort', 'default') == value %}selected{% endif %}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                    <button type="submit" class="quiet">Sort</button>
+                </form>
+                {% if selection.search or selection.category or selection.scope != 'all' or selection.get('sort') %}
+                    <a class="clear-filters" href="{{ url_for('home') }}">Clear filters</a>
+                {% endif %}
+            </div>
         </div>
+        {% if selection.get('sort') in ('newest', 'oldest') %}
+            <p class="sort-note">Insertion order within personal and shared snippets. Historical dates are unavailable.</p>
+        {% endif %}
 
         <details class="hidden-defaults" id="hidden-defaults" {% if manage_hidden %}open{% endif %}>
             <summary>Hidden defaults{% if hidden %} ({{ hidden|length }}){% endif %}</summary>
@@ -136,41 +171,63 @@
 
         {% if snippets %}
             <div class="snippet-list">
-                {% for sno, name, cat, code in snippets %}
+                {% for sno, name, cat, code, favorite in snippets %}
                     {% set shared = sno >= default_id_min %}
+                    {% set tokens = code|highlight_snippet(cat) %}
                     <article class="snippet">
                         <header class="snippet-heading">
                             <div>
                                 <h2>{{ name }}</h2>
                                 <p>{{ cat }} <span aria-hidden="true">·</span> {{ "Shared default" if shared else "Personal" }}</p>
                             </div>
-                            <details class="menu" data-menu>
+                            <div class="snippet-actions">
+                              <button type="button" class="quiet copy" data-copy="{{ code|tojson|forceescape }}" aria-label="Copy code for {{ name }}" hidden>Copy</button>
+                              <form method="post" action="{{ url_for('favorite', sno=sno, **selection) }}">
+                                {{ form_token() }}
+                                <input type="hidden" name="action" value="{{ 'remove' if favorite else 'add' }}">
+                                <button type="submit" class="quiet star" aria-pressed="{{ 'true' if favorite else 'false' }}"
+                                        aria-label="Favorite {{ name }}" title="{{ 'Remove from favorites' if favorite else 'Add to favorites' }}">{{ '★' if favorite else '☆' }}</button>
+                              </form>
+                              <details class="menu" data-menu>
                                 <summary title="Snippet actions" aria-label="Actions for {{ name }}">⋯</summary>
                                 <div class="menu-panel">
+                                    <a href="{{ url_for('duplicate', sno=sno, **selection) }}">Duplicate snippet</a>
                                     {% if shared %}
                                         <form method="post" action="{{ url_for('hide_default', sno=sno, **selection) }}">
                                             {{ form_token() }}
                                             <button type="submit">Hide default</button>
                                         </form>
                                     {% else %}
+                                        <a href="{{ url_for('edit', sno=sno, **selection) }}">Edit snippet</a>
                                         {{ confirmation("Delete snippet", "Permanently delete this personal snippet?", "delete", sno) }}
                                     {% endif %}
                                 </div>
-                            </details>
+                              </details>
+                            </div>
                         </header>
-                        <pre tabindex="0" aria-label="Code for {{ name }}"><code>{{ code }}</code></pre>
+                        <pre id="snippet-code-{{ sno }}" tabindex="0" aria-label="Code for {{ name }}"><code>{% if tokens %}{% for style, text in tokens %}{% if style %}<span class="syntax-{{ style }}">{{ text }}</span>{% else %}{{ text }}{% endif %}{% endfor %}{% else %}{{ code }}{% endif %}</code></pre>
+                        {% if code.splitlines()|length > 8 %}
+                            <button class="quiet expand" type="button" data-expand aria-controls="snippet-code-{{ sno }}"
+                                    aria-expanded="true" hidden>Collapse code</button>
+                        {% endif %}
                     </article>
                 {% endfor %}
             </div>
         {% elif not unavailable %}
             <section class="empty">
-                <h2>{% if selection.search or selection.category %}No matching snippets{% elif selection.scope == 'personal' %}No personal snippets yet{% elif selection.scope == 'defaults' %}No visible defaults{% else %}No snippets to show{% endif %}</h2>
-                <p>{% if selection.search or selection.category %}Try a different search or category.{% elif selection.scope == 'personal' %}Use New snippet to add to your library.{% elif hidden %}Open Hidden defaults to restore a template.{% else %}Use New snippet to add to your library.{% endif %}</p>
+                <h2>{% if selection.search or selection.category %}No matching snippets{% elif selection.scope == 'personal' %}No personal snippets yet{% elif selection.scope == 'defaults' %}No visible defaults{% elif selection.scope == 'favorites' %}No visible favorites{% else %}No snippets to show{% endif %}</h2>
+                <p>{% if selection.search or selection.category %}Try a different search or category.{% elif selection.scope == 'personal' %}Use New snippet to add to your library.{% elif selection.scope == 'favorites' %}Star a snippet to find it here. Hidden defaults stay out of this list.{% elif hidden %}Open Hidden defaults to restore a template.{% else %}Use New snippet to add to your library.{% endif %}</p>
             </section>
         {% endif %}
     </main>
 </div>
 <div class="toasts" aria-label="Notifications">
+    <div class="toast success" id="copy-success" hidden><p role="status"></p>
+        <button type="button" class="quiet" data-dismiss aria-label="Dismiss copy notification">×</button>
+    </div>
+    <div class="toast error" id="copy-error" hidden><p role="alert"></p>
+        <button type="button" class="quiet" data-dismiss aria-label="Dismiss copy notification">×</button>
+    </div>
     {% if error %}
         <div class="toast error"><p role="alert">{{ error }}</p><button type="button" class="quiet" data-dismiss aria-label="Dismiss notification" hidden>×</button></div>
     {% endif %}

@@ -40,3 +40,34 @@ The previous backend can run with the preference table in place. During that
 rollback, hidden defaults become visible until the new backend is redeployed.
 Keep the table and its rows so preferences survive rollback. Do not drop the
 table while any deployed backend still reads it.
+
+## WP-07 library tools
+
+The web library supports Copy, Edit on personal cards, Duplicate with a
+prefilled draft, and Favorites. A hidden shared default stays out of results
+even if it was starred. Restoring it restores visibility with its star.
+Favorites, sorting, and display controls are web features. Edits and saved
+duplicates appear in the existing VS Code client on its next fetch.
+
+The default sort keeps the existing order. Name sorting is case-insensitive
+with the snippet ID as a tie-breaker. Newest and oldest sort by serial
+insertion order within the personal and shared groups because historical
+creation dates are unavailable. Light and dark themes share the same branding.
+The preference is stored in this browser.
+
+Code highlighting is rendered locally with Pygments 2.20.0, distributed under
+the BSD 2-Clause license included in its installed Python package. Snippo uses
+recognized category names and limited Python heuristics. Unknown languages and
+oversized input render as plain text. The clipboard receives the original code.
+
+Apply `supabase/migrations/20261127205049_snippet_favorites_and_editing.sql`
+before deploying the dependent backend. Verify both private favorite tables
+and the owner-bound personal UPDATE policy. The database grants UPDATE only
+on name, category, and code, and the personal favorite foreign key binds each
+favorite to the target owner and snippet ID. Record the hosted migration
+version alongside the source filename.
+
+For rollback, redeploy the prior backend while retaining both preference
+tables and their rows. It can read the preexisting schema, and the web
+favorites and editing controls return when WP-07 is deployed again. Keep
+existing snippets and preferences in place.

@@ -9,6 +9,7 @@ from flask import Flask, abort, flash, g, jsonify, redirect, render_template, re
 
 import auth
 import store
+from snippet_highlighting import highlight
 
 load_dotenv()
 
@@ -48,7 +49,10 @@ def create_app(config=None):
         app.config.update(config)
     app.register_blueprint(auth.bp)
     app.jinja_env.globals["csrf_token"] = auth.csrf_token
-    library_endpoints = {"home", "add", "delete", "hide_default", "restore_default", "restore_defaults"}
+    app.jinja_env.filters["highlight_snippet"] = highlight
+    editor_endpoints = {"edit", "duplicate"}
+    library_endpoints = {"home", "add", "delete", "hide_default", "restore_default", "restore_defaults",
+                         "favorite"} | editor_endpoints
 
     @app.before_request
     def authorize():
@@ -97,8 +101,10 @@ def create_app(config=None):
     @app.errorhandler(psycopg2.Error)
     def database_error(_error):
         if request.endpoint in library_endpoints and getattr(g, "owner", None):
-            draft = request.form if request.endpoint == "add" else None
+            draft = request.form if request.method == "POST" and request.endpoint in editor_endpoints | {"add"} else None
+            editor = request.endpoint if request.endpoint in editor_endpoints and draft is not None else "add"
             return library_page(draft=draft, error="The library is temporarily unavailable. Try again shortly.",
+                                editor=editor, source_id=(request.view_args or {}).get("sno"),
                                 unavailable=True, status=503)
         return service_error(503)
 
@@ -119,22 +125,27 @@ def create_app(config=None):
         search = request.args.get("search", "")
         category = request.args.get("category", "")
         scope = request.args.get("scope", "all")
-        return {
+        selection = {
             "search": search if "\x00" not in search else "",
             "category": category if "\x00" not in category else "",
-            "scope": scope if scope in ("all", "personal", "defaults") else "all",
+            "scope": scope if scope in ("all", "personal", "defaults", "favorites") else "all",
         }
+        sort = request.args.get("sort")
+        if sort in store.SNIPPET_ORDERS and sort != "default":
+            selection["sort"] = sort
+        return selection
 
-    def library_page(draft=None, error=None, unavailable=False, status=200):
+    def library_page(draft=None, error=None, unavailable=False, status=200, editor="add", source_id=None):
         selection = filters()
         snippets, categories, hidden = [], [], []
         if not unavailable:
-            snippets, categories = store.list_snippets(g.owner, **selection, include_categories=True)
+            snippets, categories = store.list_snippets(g.owner, **selection, include_categories=True,
+                                                       include_favorites=True)
             hidden = store.hidden_defaults(g.owner)
         return render_template("index.html", snippets=snippets, categories=categories,
                                default_id_min=store.DEFAULT_ID_MIN, selection=selection, hidden=hidden,
                                manage_hidden=request.args.get("manage") == "1", draft=draft, error=error,
-                               unavailable=unavailable), status
+                               unavailable=unavailable, editor=editor, source_id=source_id), status
 
     def library_redirect(manage=False):
         return redirect(url_for("home", **filters(), manage=1 if manage else None,
@@ -162,6 +173,46 @@ def create_app(config=None):
         if not valid_id(sno) or not store.delete_snippet(g.owner, sno):
             return library_page(error="Personal snippet not found.", status=404)
         flash("Snippet deleted.", "library-success")
+        return library_redirect()
+
+    @app.route("/edit/<int:sno>", methods=["GET", "POST"], endpoint="edit")
+    @app.route("/duplicate/<int:sno>", methods=["GET", "POST"], endpoint="duplicate")
+    def snippet_editor(sno):
+        duplicating = request.endpoint == "duplicate"
+        if not valid_id(sno) or (not duplicating and sno >= store.DEFAULT_ID_MIN):
+            return library_page(error="Snippet not found.", status=404)
+        source = store.get_snippet(g.owner, sno)
+        if source is None:
+            return library_page(error="Snippet not found.", status=404)
+        _, name, category, original = source
+        if request.method == "GET":
+            draft = {"name": name + " (copy)" if duplicating else name, "cat": category, "code": original}
+            return library_page(draft=draft, editor=request.endpoint, source_id=sno)
+
+        fields, error = snippet_fields(request.form)
+        if error:
+            return library_page(draft=request.form, editor=request.endpoint, source_id=sno, error=error, status=400)
+        name, category, code = fields
+        # HTML forms normalize textarea newlines. Keep the original bytes for unchanged code.
+        if normal_newlines(code) == normal_newlines(original):
+            code = original
+        if duplicating:
+            store.add_snippet(g.owner, name, category, code)
+            flash("Snippet duplicated.", "library-success")
+        elif store.edit_snippet(g.owner, sno, name, category, code):
+            flash("Snippet updated.", "library-success")
+        else:
+            return library_page(error="Snippet not found.", status=404)
+        return library_redirect()
+
+    @app.post("/favorites/<int:sno>")
+    def favorite(sno):
+        action = request.form.get("action")
+        if action not in ("add", "remove"):
+            return library_page(error="Choose whether to add or remove the favorite.", status=400)
+        if not valid_id(sno) or not store.set_favorite(g.owner, sno, favorite=action == "add"):
+            return library_page(error="Snippet not found.", status=404)
+        flash("Added to favorites." if action == "add" else "Removed from favorites.", "library-success")
         return library_redirect()
 
     @app.post("/defaults/<int:sno>/hide")
@@ -230,6 +281,10 @@ def create_app(config=None):
 
 def valid_id(sno):
     return 0 <= sno <= 2147483647
+
+
+def normal_newlines(value):
+    return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def snippet_json(row):
