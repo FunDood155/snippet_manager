@@ -113,13 +113,16 @@
 
         <!-- Snippets -->
 
-        <h2 class="section-title">Your Snippets</h2>
+        <h2 class="section-title">Snippet Library</h2>
 
         {% for snippet in snippets %}
 
             <div class="snippet">
 
                 <h2>{{ snippet[1] }}</h2>
+                {% if snippet[0] >= default_id_min %}
+                    <p>Shared default</p>
+                {% endif %}
 
                 <p class="category">
                     Category: {{ snippet[2] }}
@@ -127,6 +130,7 @@
 
                 <pre>{{ snippet[3] }}</pre>
 
+                {% if snippet[0] < default_id_min %}
                 <form action="/delete/{{ snippet[0] }}" method="POST">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
@@ -135,6 +139,7 @@
                     </button>
 
                 </form>
+                {% endif %}
 
             </div>
 

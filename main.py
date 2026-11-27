@@ -113,7 +113,8 @@ def create_app(config=None):
         snippets, categories = store.list_snippets(
             g.owner, request.args.get("search"), request.args.get("category"), include_categories=True,
         )
-        return render_template("index.html", snippets=snippets, categories=categories)
+        return render_template("index.html", snippets=snippets, categories=categories,
+                               default_id_min=store.DEFAULT_ID_MIN)
 
     @app.get("/account/deletion")
     def account_deletion():
