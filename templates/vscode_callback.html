@@ -3,7 +3,8 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ "Authorization successful" if authorized else "Authorization declined" }} · Snippo</title>
+    {% set title = "VS Code callback closed" if callback_ended else ("Authorization successful" if authorized else "Authorization declined") %}
+    <title>{{ title }} · Snippo</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='vscode_callback.css') }}">
 </head>
 <body>
@@ -14,24 +15,34 @@
         </header>
 
         <section class="callback-panel" aria-labelledby="callback-title">
+            {% if callback_ended %}
+                <h1 id="callback-title">{{ title }}</h1>
+                <p class="description">If you still need to connect, start sign-in again from VS Code.</p>
+                <a class="action action--secondary" href="{{ url_for('home') }}">Manage my snippets</a>
+            {% else %}
             <div class="status-icon{{ ' status-icon--declined' if not authorized }}" aria-hidden="true">
                 <span>{{ "✓" if authorized else "×" }}</span>
             </div>
-            <h1 id="callback-title">{{ "Authorization successful" if authorized else "Authorization declined" }}</h1>
+            <h1 id="callback-title">{{ title }}</h1>
             {% if authorized %}
                 <p class="description">Open VS Code to finish signing in and return to your workspace.</p>
             {% else %}
                 <p class="description">Open VS Code to return the cancellation to the editor.</p>
             {% endif %}
-            <p class="description">If your browser or editor does not open automatically, use the button for your editor below.</p>
+            {% if launch %}
+                <p class="description">If VS Code does not open automatically, choose the button for your editor.</p>
+            {% endif %}
 
             <div class="actions">
-                <a id="open-vscode" class="action action--primary" href="vscode://dineshkaarthik.snippo-code-snippets/auth?{{ query }}">Open VS Code</a>
+                <a id="open-vscode" class="action action--primary"
+                   {% if launch %}data-launch-marker="{{ launch.marker }}" data-launch-expires="{{ launch.expires }}"{% endif %}
+                   href="vscode://dineshkaarthik.snippo-code-snippets/auth?{{ query }}">Open VS Code</a>
                 <a class="action action--secondary" href="{{ url_for('home') }}" target="_blank" rel="noopener noreferrer">Manage my snippets (new tab)</a>
             </div>
             <a class="insiders" href="vscode-insiders://dineshkaarthik.snippo-code-snippets/auth?{{ query }}">Open VS Code Insiders</a>
+            {% endif %}
         </section>
     </main>
-    <script src="{{ url_for('static', filename='vscode_callback.js') }}" defer></script>
+    {% if not callback_ended %}<script src="{{ url_for('static', filename='vscode_launch.js') }}" defer></script>{% endif %}
 </body>
 </html>

@@ -138,7 +138,8 @@ class MockProvider:
             return {"client": {"id": CLIENT}, "redirect_uri": ORIGIN + auth.CALLBACK_PATH}
         if path == "/oauth/authorizations/" + ATTEMPT + "/consent":
             origin = "https://untrusted.invalid" if self.invalid_redirect else ORIGIN
-            return {"redirect_url": origin + auth.CALLBACK_PATH + "?code=foo"}
+            result = "code=foo" if body["action"] == "approve" else "error=access_denied"
+            return {"redirect_url": origin + auth.CALLBACK_PATH + "?state=" + "a" * 43 + "&" + result}
         if method == "DELETE" and path.startswith("/user/oauth/grants?"):
             owner = self.token_user[token]
             self.oauth_tokens = {key: user for key, user in self.oauth_tokens.items() if user != owner}
@@ -563,7 +564,7 @@ class AppTest(unittest.TestCase):
         data = {"csrf_token": csrf(self.browser, path), "action": "approve", "authorization_id": ATTEMPT}
         self.assertEqual(
             self.browser.post("/oauth/consent", data=data).location,
-            ORIGIN + auth.CALLBACK_PATH + "?code=foo",
+            ORIGIN + auth.CALLBACK_PATH + "?state=" + "a" * 43 + "&code=foo",
         )
         self.assertIn(("POST", f"/oauth/authorizations/{ATTEMPT}/consent", {"action": "approve"}), auth.provider.calls)
         auth.provider.invalid_redirect = True
@@ -591,9 +592,10 @@ class AppTest(unittest.TestCase):
                 self.assertIn(b'href="/" target="_blank" rel="noopener noreferrer"', response.data)
                 self.assertIn(b"Manage my snippets", response.data)
                 self.assertIn(b"/static/vscode_callback.css", response.data)
-                self.assertIn(b'<script src="/static/vscode_callback.js" defer>', response.data)
+                self.assertIn(b'<script src="/static/vscode_launch.js" defer>', response.data)
                 self.assertIn("script-src 'self'", response.headers["Content-Security-Policy"])
                 self.assertIn(b'id="open-vscode"', response.data)
+                self.assertNotIn(b"data-launch-marker", response.data)
                 self.assertIsNone(response.headers.get("Location"))
                 for scheme in ("vscode", "vscode-insiders"):
                     uri = f'{scheme}://dineshkaarthik.snippo-code-snippets/auth?state={state}&amp;{payload}'
@@ -601,7 +603,68 @@ class AppTest(unittest.TestCase):
         self.assertNotIn("script-src", self.browser.get("/login").headers["Content-Security-Policy"])
         invalid = self.browser.get(auth.CALLBACK_PATH, query_string={"state": "bogus", "code": "test"})
         self.assertEqual(invalid.status_code, 400)
-        self.assertNotIn(b"/static/vscode_callback.js", invalid.data)
+        self.assertNotIn(b"/static/vscode_launch.js", invalid.data)
+
+    def test_only_fresh_matching_consent_issues_short_lived_launch(self):
+        self.login()
+        consent_url = "/oauth/consent?authorization_id=" + ATTEMPT
+        consent = {"csrf_token": csrf(self.browser, consent_url), "action": "approve", "authorization_id": ATTEMPT}
+        callback = self.browser.post("/oauth/consent", data=consent).location.removeprefix(ORIGIN)
+        with self.browser.session_transaction() as signed_session:
+            grant = signed_session[auth.VSCODE_LAUNCH_SESSION_KEY]
+            self.assertEqual(set(grant), {"digest", "expires"})
+        self.assertNotIn(b"data-launch-marker", self.browser.get(callback.replace("code=foo", "code=other")).data)
+        self.assertNotIn(b"data-launch-marker", self.app.test_client().get(callback).data)
+        fresh = self.browser.get(callback)
+        marker = re.search(rb'data-launch-marker="([0-9a-f]{64})"', fresh.data)[1]
+        self.assertNotIn(b"data-launch-marker", self.browser.get(callback).data)
+        clean_url = self.browser.get(auth.CALLBACK_PATH)
+        self.assertIn(b"start sign-in again from VS Code", clean_url.data)
+        self.assertNotIn(b'id="open-vscode"', clean_url.data)
+
+        provider_fixture = auth.provider
+        with patch("auth.provider", side_effect=lambda method, path, **kwargs:
+                   {"redirect_url": ORIGIN + callback} if path.startswith("/oauth/authorizations/")
+                   else provider_fixture(method, path, **kwargs)):
+            for method in ("GET", "POST"):
+                response = (self.browser.get(consent_url) if method == "GET"
+                            else self.browser.post("/oauth/consent", data=consent))
+                self.assertEqual(response.location, ORIGIN + callback)
+                self.assertNotIn(b"data-launch-marker", self.browser.get(callback).data)
+
+        later = callback.replace("a" * 43, "b" * 43).replace("code=foo", "code=bar")
+        with patch("auth.provider", side_effect=lambda method, path, **kwargs:
+                   {"redirect_url": ORIGIN + later} if path.endswith("/consent")
+                   else provider_fixture(method, path, **kwargs)):
+            self.assertEqual(self.browser.post("/oauth/consent", data=consent).location, ORIGIN + later)
+        later_marker = re.search(rb'data-launch-marker="([0-9a-f]{64})"', self.browser.get(later).data)[1]
+        self.assertNotEqual(marker, later_marker)
+
+        self.browser.post("/oauth/consent", data=consent)
+        with self.browser.session_transaction() as signed_session:
+            grant = signed_session[auth.VSCODE_LAUNCH_SESSION_KEY]
+            signed_session[auth.VSCODE_LAUNCH_SESSION_KEY] = {**grant, "expires": 1}
+        self.assertNotIn(b"data-launch-marker", self.browser.get(callback).data)
+        consent["action"] = "deny"
+        denied_url = self.browser.post("/oauth/consent", data=consent).location.removeprefix(ORIGIN)
+        denied = self.browser.get(denied_url)
+        self.assertIn(b"Authorization declined", denied.data)
+        self.assertNotIn(b"data-launch-marker", denied.data)
+
+    def test_cleanup_can_run_without_owning_the_managed_auth_table(self):
+        cleanup = RETIRE_STARTERS.strip().removeprefix("BEGIN;").removesuffix("COMMIT;")
+        with closing(psycopg2.connect(self.admin)) as conn, conn.cursor() as cur:
+            cur.execute("""
+                ALTER TABLE auth.users OWNER TO supabase_auth_admin;
+                GRANT SELECT, UPDATE ON auth.users TO wp01_migrator;
+                ALTER TABLE public.default_snippets OWNER TO wp01_migrator;
+                SET LOCAL ROLE wp01_migrator;
+            """)
+            cur.execute("SELECT pg_has_role(current_user, 'supabase_auth_admin', 'USAGE'), "
+                        "pg_has_role(current_user, 'snippet_starter', 'SET')")
+            self.assertEqual(cur.fetchone(), (False, False))
+            cur.execute(cleanup)
+            conn.rollback()
 
     def test_db_rls_and_revoked_api_acl(self):
         row_id = store.add_snippet(A, "SQL fixture", "rls", "fixture")
