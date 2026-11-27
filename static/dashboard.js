@@ -235,7 +235,7 @@ async function readLibrary(url, options = {}) {
                 location.assign(url);
                 return;
             }
-            showLibraryError('Could not refresh the library. Try again.');
+            if (!options.keepNotices) showLibraryError('Could not refresh the library. Try again.');
             announce('');
         }
     } finally {
