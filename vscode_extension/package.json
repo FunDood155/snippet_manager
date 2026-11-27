@@ -1,6 +1,6 @@
 {
-  "name": "snippo",
-  "displayName": "Snippo",
+  "name": "snippo-code-snippets",
+  "displayName": "Snippo - Code Snippets",
   "description": "Save snippets in your web library, then search and insert them in VS Code.",
   "version": "1.0.0",
   "license": "MIT",

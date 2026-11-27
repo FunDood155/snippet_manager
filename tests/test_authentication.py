@@ -566,7 +566,7 @@ class AppTest(unittest.TestCase):
         auth.provider.invalid_redirect = True
         self.assertEqual(self.browser.post("/oauth/consent", data=data).status_code, 400)
         callback = self.browser.get(auth.CALLBACK_PATH, query_string={"state": "a" * 43, "code": "test"})
-        self.assertIn(b"vscode://dineshkaarthik.snippo/auth", callback.data)
+        self.assertIn(b"vscode://dineshkaarthik.snippo-code-snippets/auth", callback.data)
         self.assertEqual(self.browser.get(auth.CALLBACK_PATH + "?state=bogus&code=foo").status_code, 400)
         self.assertEqual(self.browser.post("/oauth/vscode/revoke", data=data).status_code, 200)
         self.assertEqual(self.browser.get("/api/session", headers=self.api_a).status_code, 401)
@@ -593,7 +593,7 @@ class AppTest(unittest.TestCase):
                 self.assertIn(b'id="open-vscode"', response.data)
                 self.assertIsNone(response.headers.get("Location"))
                 for scheme in ("vscode", "vscode-insiders"):
-                    uri = f'{scheme}://dineshkaarthik.snippo/auth?state={state}&amp;{payload}'
+                    uri = f'{scheme}://dineshkaarthik.snippo-code-snippets/auth?state={state}&amp;{payload}'
                     self.assertIn(uri.encode(), response.data)
         self.assertNotIn("script-src", self.browser.get("/login").headers["Content-Security-Policy"])
         invalid = self.browser.get(auth.CALLBACK_PATH, query_string={"state": "bogus", "code": "test"})

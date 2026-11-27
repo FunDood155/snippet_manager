@@ -23,7 +23,7 @@ cd vscode_extension
 npm ci
 npm test
 npm run package
-code --install-extension ./snippo-1.0.0.vsix
+code --install-extension ./snippo-code-snippets-1.0.0.vsix
 ```
 
 Or use **Extensions: Install from VSIX...**. Review `npm audit` for build-tool exposure and `npm audit --omit=dev` for distributable dependencies.

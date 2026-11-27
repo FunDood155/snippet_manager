@@ -14,7 +14,7 @@ with Supabase Auth. It talks to Flask for snippets and never connects to Postgre
 - VS Code Desktop and Insiders use the Supabase OAuth 2.1 server, a public client
   with S256 PKCE, a random state, and one registered HTTPS redirect URI.
   The browser bridge returns a short-lived code and state to the fixed extension
-  ID `dineshkaarthik.snippo`. The extension accepts the matching callback once, within five minutes.
+  ID `dineshkaarthik.snippo-code-snippets`. The extension accepts the matching callback once, within five minutes.
   The browser never receives the desktop access or refresh token. VS Code stores
   the tokens in SecretStorage and renews them as needed. Browser-only VS Code
   and remote extension-host authentication are outside WP-01.
@@ -163,7 +163,7 @@ python -m unittest discover -s tests -v
 cd vscode_extension
 npm ci
 npm test
-npm run package -- --out ./snippo-1.0.0.vsix
+npm run package -- --out ./snippo-code-snippets-1.0.0.vsix
 ```
 
 The npm tests use mocked VS Code and HTTP endpoints. The VSIX includes compiled

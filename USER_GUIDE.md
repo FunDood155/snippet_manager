@@ -175,14 +175,14 @@ A `.vsix` file is the installable package for a VS Code extension.
 It will look something like:
 
 ```text
-snippo-1.0.0.vsix
+snippo-code-snippets-1.0.0.vsix
 ```
 
 ---
 
 ## Step 1 — Get the VSIX
 
-Obtain the latest `.vsix` package for Code Snippet Manager.
+Obtain the latest `.vsix` package for Snippo - Code Snippets. If you used the private-test Snippo extension (`dineshkaarthik.snippo`), uninstall it first. Reload VS Code after installing the new package and sign in again with your existing Snippo account to access your saved snippets.
 
 Keep the file somewhere easy to find, such as:
 
@@ -223,7 +223,7 @@ Select it.
 Find:
 
 ```text
-snippo-1.0.0.vsix
+snippo-code-snippets-1.0.0.vsix
 ```
 
 and select it.
