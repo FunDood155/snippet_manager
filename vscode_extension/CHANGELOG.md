@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1
+
+- Shows a cancellable loading picker while Show, Search, and Insert fetch authorized snippets.
+- Shares equivalent overlapping requests and discards results when the session or server changes.
+
 ## 1.0.0 — Release candidate
 
 - Introduces Snippo under the `dineshkaarthik.snippo-code-snippets` extension ID.

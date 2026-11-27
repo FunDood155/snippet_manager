@@ -1,0 +1,177 @@
+{% from 'library_forms.html' import form_token, confirmation with context %}
+<main id="library-content" data-location="{{ library_location }}" data-editor="{{ editor }}">
+        <section class="library-heading" aria-labelledby="library-title">
+            <h1 id="library-title">Snippet Library</h1>
+            <details class="composer" {% if draft is not none %}open{% endif %}>
+                <summary class="primary">
+                    {% if editor == 'edit' %}Edit snippet{% elif editor == 'duplicate' %}Duplicate snippet{% else %}
+                        <span aria-hidden="true">+</span> New snippet
+                    {% endif %}
+                </summary>
+                <form method="post" data-library-write action="{{ url_for(editor, sno=source_id, **selection) }}" class="composer-form">
+                    {{ form_token() }}
+                    <div class="fields">
+                        <label>Snippet name
+                            <input name="name" required value="{{ draft.get('name', '') if draft is not none else '' }}">
+                        </label>
+                        <label>Category
+                            <input name="cat" required value="{{ draft.get('cat', '') if draft is not none else '' }}">
+                        </label>
+                    </div>
+                    <label>Code
+                        <textarea name="code" rows="5" required>{{ '\n' }}{{ draft.get('code', '') if draft is not none else '' }}</textarea>
+                    </label>
+                    <div class="form-actions">
+                        {% if editor == 'add' %}
+                            <button class="quiet" type="button" data-close hidden>Cancel</button>
+                        {% else %}
+                            <a data-library-nav class="quiet action-link" href="{{ url_for('home', **selection) }}">Cancel</a>
+                        {% endif %}
+                        <button class="primary" type="submit">Save snippet</button>
+                    </div>
+                </form>
+            </details>
+        </section>
+
+        <form class="filters" data-library-read method="get" action="{{ url_for('home') }}" aria-label="Search and category filters">
+            {% if selection.scope != 'all' %}<input type="hidden" name="scope" value="{{ selection.scope }}">{% endif %}
+            {% if selection.get("sort") %}<input type="hidden" name="sort" value="{{ selection.sort }}">{% endif %}
+            <label class="search">
+                <span class="sr-only">Search snippets</span>
+                <span class="search-symbol" aria-hidden="true"></span>
+                <input name="search" type="search" placeholder="Search snippets…" value="{{ selection.search }}">
+            </label>
+            <div>
+                <label class="sr-only" for="filter-category">Filter by category</label>
+                <select id="filter-category" name="category">
+                    <option value="">All categories</option>
+                    {% if selection.category and (selection.category,) not in categories %}
+                        <option selected>{{ selection.category }}</option>
+                    {% endif %}
+                    {% for (category,) in categories %}
+                        <option {% if selection.category == category %}selected{% endif %}>{{ category }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <button type="submit" class="quiet">Search</button>
+        </form>
+
+        <div class="toolbar">
+            <nav class="scopes" aria-label="Snippet type">
+                {% for scope, label in [('all', 'All snippets'), ('personal', 'Personal'), ('defaults', 'Defaults'), ('favorites', 'Favorites')] %}
+                    <a data-library-nav href="{{ url_for('home', scope=scope, search=selection.search, category=selection.category, sort=selection.get('sort')) }}"
+                       {% if selection.scope == scope %}aria-current="page"{% endif %}>{{ label }}</a>
+                {% endfor %}
+            </nav>
+            <div class="results-controls">
+                {% if not unavailable %}
+                    <span class="results-count">{{ total }} {{ 'snippet' if total == 1 else 'snippets' }}</span>
+                {% endif %}
+                <form method="get" action="{{ url_for('home') }}" class="sort-form" data-library-read>
+                    <input type="hidden" name="search" value="{{ selection.search }}">
+                    <input type="hidden" name="category" value="{{ selection.category }}">
+                    <input type="hidden" name="scope" value="{{ selection.scope }}">
+                    <label class="sr-only" for="snippet-sort">Sort snippets</label>
+                    <select id="snippet-sort" name="sort">
+                        {% for value, label in [('default', 'Default order'), ('name', 'Name A–Z'), ('newest', 'Newest in each group'), ('oldest', 'Oldest in each group')] %}
+                            <option value="{{ value }}" {% if selection.get('sort', 'default') == value %}selected{% endif %}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                    <button type="submit" class="quiet">Sort</button>
+                </form>
+                {% if selection.search or selection.category or selection.scope != 'all' or selection.get('sort') %}
+                    <a data-library-nav class="clear-filters" href="{{ url_for('home') }}">Clear filters</a>
+                {% endif %}
+            </div>
+        </div>
+        {% if selection.get('sort') in ('newest', 'oldest') %}
+            <p class="sort-note">Insertion order within personal and shared snippets. Historical dates are unavailable.</p>
+        {% endif %}
+
+        <details class="hidden-defaults" id="hidden-defaults" {% if manage_hidden %}open{% endif %}>
+            <summary>Hidden defaults{% if hidden %} ({{ hidden|length }}){% endif %}</summary>
+            {% if unavailable %}
+                <p>Hidden defaults are temporarily unavailable.</p>
+            {% elif hidden %}
+                <ul>
+                    {% for sno, name, cat in hidden %}
+                        <li>
+                            <span>{{ name }} <small>{{ cat }}</small></span>
+                            <form method="post" data-library-write action="{{ url_for('restore_default', sno=sno, **selection) }}">
+                                {{ form_token() }}
+                                <button class="quiet" type="submit" aria-label="Restore {{ name }}">Restore</button>
+                            </form>
+                        </li>
+                    {% endfor %}
+                </ul>
+                <form method="post" data-library-write action="{{ url_for('restore_defaults', **selection) }}">
+                    {{ form_token() }}
+                    <button class="quiet" type="submit">Restore all defaults</button>
+                </form>
+            {% else %}
+                <p>You have no hidden defaults.</p>
+            {% endif %}
+        </details>
+
+        {% if snippets %}
+            <div class="snippet-list">
+                {% for sno, name, cat, code, favorite in snippets %}
+                    {% set shared = sno >= default_id_min %}
+                    {% set tokens = code|highlight_snippet(cat) %}
+                    <article class="snippet" data-snippet-id="{{ sno }}">
+                        <header class="snippet-heading">
+                            <div>
+                                <h2>{{ name }}</h2>
+                                <p>{{ cat }} <span aria-hidden="true">·</span> {{ "Shared default" if shared else "Personal" }}</p>
+                            </div>
+                            <div class="snippet-actions">
+                              <button type="button" class="quiet copy" data-copy="{{ code|tojson|forceescape }}" aria-label="Copy code for {{ name }}" hidden>Copy</button>
+                              <form method="post" data-library-write action="{{ url_for('favorite', sno=sno, **selection) }}">
+                                {{ form_token() }}
+                                <input type="hidden" name="action" value="{{ 'remove' if favorite else 'add' }}">
+                                <button type="submit" class="quiet star" aria-pressed="{{ 'true' if favorite else 'false' }}"
+                                        aria-label="Favorite {{ name }}" title="{{ 'Remove from favorites' if favorite else 'Add to favorites' }}">{{ '★' if favorite else '☆' }}</button>
+                              </form>
+                              <details class="menu" data-menu>
+                                <summary title="Snippet actions" aria-label="Actions for {{ name }}">⋯</summary>
+                                <div class="menu-panel">
+                                    <a data-library-nav href="{{ url_for('duplicate', sno=sno, **selection) }}">Duplicate snippet</a>
+                                    {% if shared %}
+                                        <form method="post" data-library-write action="{{ url_for('hide_default', sno=sno, **selection) }}">
+                                            {{ form_token() }}
+                                            <button type="submit">Hide default</button>
+                                        </form>
+                                    {% else %}
+                                        <a data-library-nav href="{{ url_for('edit', sno=sno, **selection) }}">Edit snippet</a>
+                                        {{ confirmation("Delete snippet", "Permanently delete this personal snippet?", "delete", sno) }}
+                                    {% endif %}
+                                </div>
+                              </details>
+                            </div>
+                        </header>
+                        <pre id="snippet-code-{{ sno }}" tabindex="0" aria-label="Code for {{ name }}"><code>{% if tokens %}{% for style, text in tokens %}{% if style %}<span class="syntax-{{ style }}">{{ text }}</span>{% else %}{{ text }}{% endif %}{% endfor %}{% else %}{{ code }}{% endif %}</code></pre>
+                        {% if code.splitlines()|length > 8 %}
+                            <button class="quiet expand" type="button" data-expand aria-controls="snippet-code-{{ sno }}"
+                                    aria-expanded="true" hidden>Collapse code</button>
+                        {% endif %}
+                    </article>
+                {% endfor %}
+            </div>
+        {% elif not unavailable %}
+            <section class="empty">
+                <h2>{% if selection.search or selection.category %}No matching snippets{% elif selection.scope == 'personal' %}No personal snippets yet{% elif selection.scope == 'defaults' %}No visible defaults{% elif selection.scope == 'favorites' %}No visible favorites{% else %}No snippets to show{% endif %}</h2>
+                <p>{% if selection.search or selection.category %}Try a different search or category.{% elif selection.scope == 'personal' %}Use New snippet to add to your library.{% elif selection.scope == 'favorites' %}Star a snippet to find it here. Hidden defaults stay out of this list.{% elif hidden %}Open Hidden defaults to restore a template.{% else %}Use New snippet to add to your library.{% endif %}</p>
+            </section>
+        {% endif %}
+    {% if pages > 1 %}
+        <nav class="library-pages" aria-label="Library pages">
+            {% if page > 1 %}
+                <a class="quiet action-link" data-library-nav rel="prev" href="{{ url_for('home', page=page-1 if page > 2 else none, revision=revision if page > 2 else none, **selection) }}">Previous</a>
+            {% endif %}
+            <span>Page {{ page }} of {{ pages }}</span>
+            {% if page < pages %}
+                <a class="quiet action-link" data-library-nav rel="next" href="{{ url_for('home', page=page+1, revision=revision, **selection) }}">Next</a>
+            {% endif %}
+        </nav>
+    {% endif %}
+</main>

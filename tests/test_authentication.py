@@ -9,7 +9,7 @@ from contextlib import closing
 from html import unescape
 from pathlib import Path
 from unittest.mock import patch
-from threading import Barrier
+from threading import Barrier, Event
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -249,6 +249,178 @@ class AppTest(unittest.TestCase):
         return self.browser.post("/api/snippets", headers=headers, json={
             "name": "shared name", "cat": "sample", "code": "test code", **overrides,
         })
+
+    def shared_browser(self):
+        other = self.app.test_client()
+        cookie = self.browser.get_cookie("__Host-snippet_session")
+        other.set_cookie(cookie.key, cookie.value)
+        return other
+
+    def test_ordinary_web_verifications_overlap_for_one_cookie(self):
+        self.login()
+        waiting = Barrier(2)
+        original = auth.provider
+
+        def concurrent(method, path, **kwargs):
+            if path == "/user":
+                connection = store.g.snippet_connection
+                self.assertEqual(connection.get_transaction_status(), psycopg2.extensions.TRANSACTION_STATUS_IDLE)
+                waiting.wait(timeout=3)
+            return original(method, path, **kwargs)
+
+        with patch("auth.provider", side_effect=concurrent), ThreadPoolExecutor(max_workers=2) as pool:
+            clients = [self.shared_browser() for _ in range(2)]
+            self.assertEqual(list(pool.map(lambda client: client.get("/").status_code, clients)), [200, 200])
+
+    def test_logout_and_account_hold_are_rechecked_after_verification(self):
+        def request_during(change):
+            started, release = Event(), Event()
+            original = auth.provider
+
+            def blocked(method, path, **kwargs):
+                verified = original(method, path, **kwargs)
+                if path == "/user" and not started.is_set():
+                    started.set()
+                    self.assertTrue(release.wait(5))
+                return verified
+
+            with patch("auth.provider", side_effect=blocked), ThreadPoolExecutor(max_workers=1) as pool:
+                other = self.shared_browser()
+                running = pool.submit(other.get, "/")
+                try:
+                    self.assertTrue(started.wait(5))
+                    change()
+                finally:
+                    release.set()
+                return running.result(timeout=5)
+
+        self.login()
+        with self.browser.session_transaction() as browser_session:
+            csrf_value = browser_session.get("csrf")
+        if not csrf_value:
+            csrf_value = csrf(self.browser, "/")
+        response = request_during(lambda: self.assertEqual(self.browser.post(
+            "/logout", data={"csrf_token": csrf_value}).status_code, 303))
+        self.assertEqual(response.location, "/login")
+
+        self.login()
+        try:
+            def hold_account():
+                with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+                    cur.execute("INSERT INTO snippet_private.legacy_email_holds (user_id) VALUES (%s)", (A,))
+            self.assertEqual(request_during(hold_account).location, "/login")
+        finally:
+            with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM snippet_private.legacy_email_holds WHERE user_id = %s", (A,))
+
+    def test_concurrent_expiry_refreshes_once(self):
+        self.login()
+        with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+            cur.execute("UPDATE snippet_private.web_sessions SET token_expires_at = 0")
+        ready = Barrier(3)
+        original = auth.provider
+        refreshed = Event()
+        release = Event()
+
+        def delaying(method, path, **kwargs):
+            if path == "/token?grant_type=refresh_token":
+                refreshed.set()
+                self.assertTrue(release.wait(5))
+            return original(method, path, **kwargs)
+
+        def load(client):
+            ready.wait(timeout=5)
+            return client.get("/").status_code
+
+        with patch("auth.provider", side_effect=delaying), ThreadPoolExecutor(max_workers=2) as pool:
+            results = [pool.submit(load, self.shared_browser()) for _ in range(2)]
+            try:
+                ready.wait(timeout=5)
+                self.assertTrue(refreshed.wait(5))
+            finally:
+                release.set()
+            self.assertEqual([result.result(timeout=5) for result in results], [200, 200])
+        self.assertEqual(sum(path == "/token?grant_type=refresh_token" for _, path, _ in original.calls), 1)
+
+    def test_cutoff_during_token_refresh_rejects_the_source_session(self):
+        self.login()
+        with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+            cur.execute("UPDATE snippet_private.web_sessions SET token_expires_at = 0")
+        original = auth.provider
+
+        def rotate_after_cutoff(method, path, **kwargs):
+            if path == "/token?grant_type=refresh_token":
+                with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+                    cur.execute("INSERT INTO snippet_private.session_cutoffs VALUES (%s, %s)", (A, int(time.time())))
+                original.token_offset = 10
+            return original(method, path, **kwargs)
+
+        with patch("auth.provider", side_effect=rotate_after_cutoff):
+            self.assertEqual(self.browser.get("/").location, "/login")
+        with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM snippet_private.web_sessions")
+            self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_request_connection_reuse_rolls_back_and_does_not_share_owner(self):
+        with self.app.test_request_context("/"):
+            with store.cursor(A) as cur:
+                conn = cur.connection
+                cur.execute("SELECT current_setting('snippet.owner_id')")
+                self.assertEqual(cur.fetchone()[0], A)
+            with store.cursor() as cur:
+                self.assertIs(cur.connection, conn)
+                cur.execute("SELECT nullif(current_setting('snippet.owner_id', true), '')")
+                self.assertIsNone(cur.fetchone()[0])
+            with self.assertRaises(psycopg2.errors.DivisionByZero):
+                with store.cursor(A) as cur:
+                    cur.execute("SELECT 1 / 0")
+            self.assertTrue(conn.closed)
+            with store.cursor(B) as cur:
+                other = cur.connection
+                self.assertIsNot(other, conn)
+                cur.execute("SELECT current_setting('snippet.owner_id')")
+                self.assertEqual(cur.fetchone()[0], B)
+        self.assertTrue(other.closed)
+
+    def test_web_page_totals_and_fragment_write_keep_legacy_api_unpaginated(self):
+        self.login()
+        token = csrf(self.browser, "/")
+        with store.cursor(A) as cur:
+            cur.execute("""INSERT INTO public.snippets (owner_id, name, cat, code)
+                           SELECT %s, 'Page ' || to_char(n, 'FM000'), 'Paging', 'needle'
+                           FROM generate_series(1, 83) n""", (A,))
+        query = "category=Paging&search=need_e&scope=personal&sort=name"
+        pages = [self.browser.get(f"/?{query}&page={index}").get_data(as_text=True) for index in range(1, 4)]
+        self.assertEqual([page.count('data-snippet-id=') for page in pages], [40, 40, 3])
+        for page in pages:
+            self.assertIn("83 snippets", page)
+        keys = [re.findall(r'data-snippet-id="(\d+)"', page) for page in pages]
+        self.assertEqual(len(set().union(*map(set, keys))), 83)
+        self.assertIn("Page 041", pages[1])
+        link = unescape(re.search(r'rel="next" href="([^"]+)"', pages[0])[1])
+        with store.cursor(B) as cur:
+            cur.execute("INSERT INTO public.snippets (owner_id, name, cat, code) VALUES (%s, %s, %s, %s)",
+                        (B, "Other owner", "Other", "needle"))
+        self.assertIn(b"Page 2 of 3", self.browser.get(link).data)
+        with store.cursor(A) as cur:
+            cur.execute("UPDATE public.snippets SET name = 'Page 000' WHERE name = 'Page 083'")
+        self.assertIn(b"Page 1 of 3", self.browser.get(link).data)
+        api = self.browser.get("/api/snippets?category=Paging", headers=self.api_a)
+        self.assertEqual(len(api.json), 83)
+        self.assertEqual(self.browser.get("/api/snippets?category=Paging", headers=self.api_b).json, [])
+        headers = {"X-Snippo-Fragment": "library"}
+        before = len(auth.provider.calls)
+        response = self.browser.post(f"/favorites/{keys[0][0]}?{query}", headers=headers,
+                                     data={"csrf_token": token, "action": "add"})
+        self.assertEqual(len(auth.provider.calls) - before, 1)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertIn("X-Snippo-Fragment", response.headers["Vary"])
+        self.assertIn(b'id="library-content"', response.data)
+        self.assertNotIn(b"<!doctype html>", response.data)
+        self.assertIn(b"Added to favorites.", response.data)
+        self.assertEqual(self.browser.post(f"/favorites/{keys[0][0]}", headers=headers,
+                                          data={"action": "remove"}).status_code, 400)
 
     def test_registration_shows_verification_instructions_and_provisions_starters_once(self):
         email = "new@sample.test"

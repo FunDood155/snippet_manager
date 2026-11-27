@@ -1,0 +1,11 @@
+<div id="library-notices">
+    {% if error %}
+        <div class="toast error"><p role="alert">{{ error }}</p><button type="button" class="quiet" data-dismiss aria-label="Dismiss notification" hidden>×</button></div>
+    {% endif %}
+    {% for type, message in get_flashed_messages(with_categories=true, category_filter=['library-success', 'library-error', 'library-info']) %}
+        <div class="toast {{ 'error' if type == 'library-error' else 'success' }}" {% if type == 'library-success' %}data-expire{% endif %}>
+            <p role="{{ 'alert' if type == 'library-error' else 'status' }}">{{ message }}</p>
+            <button type="button" class="quiet" data-dismiss aria-label="Dismiss notification" hidden>×</button>
+        </div>
+    {% endfor %}
+</div>

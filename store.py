@@ -2,6 +2,7 @@ import os
 from contextlib import closing, contextmanager
 
 import psycopg2
+from flask import g, has_request_context
 
 
 DEFAULT_ID_MIN = 2_000_000_000
@@ -27,21 +28,71 @@ VISIBLE_DEFAULTS_SQL = """
 """
 
 
+def connect():
+    return psycopg2.connect(os.environ["SNIPPET_DATABASE_URL"], connect_timeout=5)
+
+
+def close_request_connection(_error=None):
+    conn = g.pop("snippet_connection", None)
+    if conn is not None:
+        conn.close()
+
+
 @contextmanager
-def cursor(owner=None):
-    # This DSN must authenticate as the dedicated NOINHERIT runtime role.
-    with closing(psycopg2.connect(os.environ["SNIPPET_DATABASE_URL"], connect_timeout=5)) as conn:
-        with conn, conn.cursor() as cur:
+def transaction(conn, owner, verify):
+    with conn, conn.cursor() as cur:
+        if verify:
             cur.execute("SELECT current_user = 'snippet_app' AND session_user = 'snippet_app'")
             if not cur.fetchone()[0]:
                 raise RuntimeError("The snippet_app database login is required")
-            if owner is not None:
-                cur.execute("SELECT set_config('snippet.owner_id', %s, true)", (owner,))
+        if owner is not None:
+            cur.execute("SELECT set_config('snippet.owner_id', %s, true)", (owner,))
+        yield cur
+
+
+@contextmanager
+def cursor(owner=None):
+    if not has_request_context():
+        with closing(connect()) as conn, transaction(conn, owner, verify=True) as cur:
             yield cur
+        return
+
+    conn = g.get("snippet_connection")
+    verify = conn is None
+    if verify:
+        conn = g.snippet_connection = connect()
+    try:
+        with transaction(conn, owner, verify) as cur:
+            yield cur
+    except BaseException:
+        # A later error handler may need to query again. Start with a fresh connection.
+        close_request_connection()
+        raise
 
 
 def list_snippets(owner, search=None, category=None, include_categories=False, scope="all", sort="default",
                   include_favorites=False):
+    with cursor(owner) as cur:
+        return select_snippets(cur, owner, search, category, include_categories, scope, sort, include_favorites)
+
+
+def library_page(owner, page, page_size, revision=None, **selection):
+    with cursor(owner) as cur:
+        rows, categories = select_snippets(cur, owner, include_categories=True, include_favorites=True,
+                                           page=page, page_size=page_size, **selection)
+        total, current_revision = rows[0][-2:]
+        if page > 1 and (rows[0][0] is None or revision not in (None, current_revision)):
+            # Restart paging if another client changed the ordered result.
+            page = 1
+            rows, categories = select_snippets(cur, owner, include_categories=True, include_favorites=True,
+                                               page=page, page_size=page_size, **selection)
+            total, current_revision = rows[0][-2:]
+        visible = [row[:-2] for row in rows if row[0] is not None]
+        return visible, categories, select_hidden_defaults(cur, owner), total, page, current_revision
+
+
+def select_snippets(cur, owner, search=None, category=None, include_categories=False, scope="all", sort="default",
+                    include_favorites=False, page=None, page_size=None):
     personal_and_defaults = PERSONAL_SQL + " UNION ALL " + VISIBLE_DEFAULTS_SQL
     library, owners = {
         "all": (personal_and_defaults, (owner, owner)),
@@ -57,23 +108,34 @@ def list_snippets(owner, search=None, category=None, include_categories=False, s
     fields = "sno, name, cat, code"
     if include_favorites:
         fields += ", favorites.snippet_id IS NOT NULL"
-    with cursor(owner) as cur:
-        sql = f"SELECT {fields} FROM {source} WHERE true"
-        params = list(owners)
-        if search:
-            sql += " AND (name ILIKE %s OR code ILIKE %s)"
-            params.extend([f"%{search}%"] * 2)
-        if category:
-            sql += " AND cat = %s"
-            params.append(category)
-        cur.execute(sql + " ORDER BY " + SNIPPET_ORDERS[sort], params)
-        rows = cur.fetchall()
-        categories = []
-        if include_categories:
-            cur.execute(f"SELECT DISTINCT cat FROM {source} ORDER BY cat", owners)
-            categories = cur.fetchall()
-        return rows, categories
-
+    sql = f"SELECT {fields} FROM {source} WHERE true"
+    params = list(owners)
+    if search:
+        sql += " AND (name ILIKE %s OR code ILIKE %s)"
+        params.extend([f"%{search}%"] * 2)
+    if category:
+        sql += " AND cat = %s"
+        params.append(category)
+    order = SNIPPET_ORDERS[sort]
+    if page is None:
+        sql += " ORDER BY " + order
+    else:
+        sql = f"""WITH filtered AS ({sql}), page_rows AS (
+                    SELECT * FROM filtered ORDER BY {order} LIMIT %s OFFSET %s
+                ), totals AS (
+                    SELECT count(*) AS total, md5(string_agg(sno::text, ',' ORDER BY {order})) AS revision
+                    FROM filtered
+                )
+                SELECT page_rows.*, totals.total, totals.revision
+                FROM totals LEFT JOIN page_rows ON true ORDER BY {order}"""
+        params.extend((page_size, (page - 1) * page_size))
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    categories = []
+    if include_categories:
+        cur.execute(f"SELECT DISTINCT cat FROM {source} ORDER BY cat", owners)
+        categories = cur.fetchall()
+    return rows, categories
 
 def get_snippet(owner, sno):
     sql = VISIBLE_DEFAULTS_SQL if sno >= DEFAULT_ID_MIN else PERSONAL_SQL
@@ -82,14 +144,13 @@ def get_snippet(owner, sno):
         return cur.fetchone()
 
 
-def hidden_defaults(owner):
-    with cursor(owner) as cur:
-        cur.execute("""
-            SELECT d.sno, d.name, d.cat FROM public.default_snippets d
-            JOIN snippet_private.hidden_default_snippets h ON h.snippet_id = d.sno
-            WHERE h.user_id = %s ORDER BY d.sno
-        """, (owner,))
-        return cur.fetchall()
+def select_hidden_defaults(cur, owner):
+    cur.execute("""
+        SELECT d.sno, d.name, d.cat FROM public.default_snippets d
+        JOIN snippet_private.hidden_default_snippets h ON h.snippet_id = d.sno
+        WHERE h.user_id = %s ORDER BY d.sno
+    """, (owner,))
+    return cur.fetchall()
 
 
 def hide_default(owner, sno):

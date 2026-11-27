@@ -293,3 +293,12 @@ pre code { font: inherit; }
     .snippet-actions { gap: .25rem; }
     .snippet-actions button { padding-inline: .38rem; }
 }
+
+.library-pages {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: .75rem;
+    margin-top: 1rem;
+}

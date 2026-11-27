@@ -5,6 +5,8 @@ import json
 import re
 import secrets
 import time
+from http.cookiejar import DefaultCookiePolicy
+from threading import local
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import UUID
 
@@ -25,6 +27,17 @@ EMAIL_LINK_PATHS = {"signup": "/auth/confirm-email", "recovery": "/auth/reset-pa
 CALLBACK_PATH = "/oauth/vscode/callback"
 VSCODE_LAUNCH_TTL = 60
 VSCODE_LAUNCH_SESSION_KEY = "vscode_launch"
+provider_transport = local()
+INVALID_SESSION_STATUSES = (400, 401, 403, 404, 422)
+
+
+def provider_session():
+    # Requests sessions carry mutable state. Reuse the transport only on this worker thread.
+    if not hasattr(provider_transport, "session"):
+        client = requests.Session()
+        client.cookies.set_policy(DefaultCookiePolicy(allowed_domains=()))
+        provider_transport.session = client
+    return provider_transport.session
 
 
 class AuthError(Exception):
@@ -39,7 +52,7 @@ def provider(method, path, *, token=None, body=None):
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
-        response = requests.request(
+        response = provider_session().request(
             method, config["SUPABASE_URL"] + "/auth/v1" + path,
             headers=headers, json=body, timeout=(3, 5), allow_redirects=False,
         )
@@ -116,7 +129,10 @@ def check_account_access(cur, owner, verified_token):
                   (SELECT invalid_through FROM snippet_private.session_cutoffs WHERE user_id = %s)""",
         (owner, owner),
     )
-    held, invalid_through = cur.fetchone()
+    check_access_state(*cur.fetchone(), verified_token)
+
+
+def check_access_state(held, invalid_through, verified_token):
     if held:
         raise AuthError(401, "legacy_email_hold")
     if invalid_through is not None:
@@ -147,41 +163,95 @@ def create_session(tokens):
     session["handle"] = handle
 
 
+def read_web_session(cur, handle_hash, *, lock=False):
+    sql = """SELECT user_id, access_token, refresh_token, token_expires_at,
+                    EXISTS (SELECT 1 FROM snippet_private.legacy_email_holds WHERE user_id = w.user_id),
+                    (SELECT invalid_through FROM snippet_private.session_cutoffs WHERE user_id = w.user_id)
+             FROM snippet_private.web_sessions w
+             WHERE handle_hash = %s AND expires_at > clock_timestamp()"""
+    cur.execute(sql + (" FOR UPDATE OF w" if lock else ""), (handle_hash,))
+    return cur.fetchone()
+
+
+def discard_web_session(cur, handle_hash, version):
+    cur.execute("""DELETE FROM snippet_private.web_sessions WHERE handle_hash = %s
+                   AND user_id = %s AND access_token = %s AND refresh_token = %s AND token_expires_at = %s""",
+                (handle_hash, *version))
+
+
+def refresh_web_session(cur, handle_hash, row):
+    owner, access, refresh, expires, held, cutoff = row
+    try:
+        check_access_state(held, cutoff, access)
+        tokens = provider("POST", "/token?grant_type=refresh_token", body={"refresh_token": refresh})
+        if confirmed_identity(tokens["user"]) != owner:
+            raise AuthError(401)
+        # A token issued during refresh must not bypass a cutoff applied to its source session.
+        check_account_access(cur, owner, access)
+        access = tokens["access_token"]
+        cur.execute("""UPDATE snippet_private.web_sessions
+                       SET access_token = %s, refresh_token = %s, token_expires_at = %s
+                       WHERE handle_hash = %s AND expires_at > clock_timestamp()""",
+                    (access, tokens["refresh_token"], int(time.time()) + int(tokens["expires_in"]), handle_hash))
+        if cur.rowcount:
+            return access
+    except AuthError as exc:
+        if exc.status not in INVALID_SESSION_STATUSES:
+            raise
+        discard_web_session(cur, handle_hash, row[:4])
+    return None
+
+
 def web_identity():
     if not session.get("handle"):
         return None
     handle_hash = digest(session["handle"])
-    with store.cursor() as cur:
-        cur.execute(
-            """SELECT user_id, access_token, refresh_token, token_expires_at
-               FROM snippet_private.web_sessions
-               WHERE handle_hash = %s AND expires_at > now() FOR UPDATE""",
-            (handle_hash,),
-        )
-        row = cur.fetchone()
-        if row:
-            owner, access, refresh, expires_at = row
-            try:
-                check_account_access(cur, owner, access)
-                # Row-level lock serializes refresh from multiple browser tabs or Flask workers.
-                if expires_at < time.time() + 45:
-                    tokens = provider("POST", "/token?grant_type=refresh_token", body={"refresh_token": refresh})
-                    if confirmed_identity(tokens["user"]) != owner:
-                        raise AuthError(401)
-                    access = tokens["access_token"]
-                    cur.execute(
-                        """UPDATE snippet_private.web_sessions
-                           SET access_token = %s, refresh_token = %s, token_expires_at = %s WHERE handle_hash = %s""",
-                        (access, tokens["refresh_token"], int(time.time()) + int(tokens["expires_in"]), handle_hash),
-                    )
-                elif confirmed_identity(provider("GET", "/user", token=access)) != owner:
-                    raise AuthError(401)
+    for _ in range(3):
+        with store.cursor() as cur:
+            row = read_web_session(cur, handle_hash)
+        if row is None:
+            break
+        owner, access, _, expires, held, cutoff = row
+        if expires < time.time() + 45:
+            with store.cursor() as cur:
+                current = read_web_session(cur, handle_hash, lock=True)
+                if current is None:
+                    break
+                if current[:4] != row[:4]:
+                    continue
+                access = refresh_web_session(cur, handle_hash, current)
+            if access:
                 g.web_token = access
                 return owner
-            except AuthError as exc:
-                if exc.status not in (400, 401, 403, 404, 422):
-                    raise
-                cur.execute("DELETE FROM snippet_private.web_sessions WHERE handle_hash = %s", (handle_hash,))
+            break
+
+        # Verify ordinary tokens with no open transaction or row lock.
+        try:
+            check_access_state(held, cutoff, access)
+            if confirmed_identity(provider("GET", "/user", token=access)) != owner:
+                raise AuthError(401)
+            verified = True
+        except AuthError as exc:
+            if exc.status not in INVALID_SESSION_STATUSES:
+                raise
+            verified = False
+
+        with store.cursor() as cur:
+            current = read_web_session(cur, handle_hash)
+            if current is None:
+                break
+            if current[:4] != row[:4]:
+                continue
+            try:
+                check_access_state(*current[4:], access)
+                if not verified:
+                    raise AuthError(401)
+            except AuthError:
+                discard_web_session(cur, handle_hash, row[:4])
+                break
+        g.web_token = access
+        return owner
+
     session.clear()
     return None
 

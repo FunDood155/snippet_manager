@@ -12,6 +12,13 @@ type SecretStorage = {
 type Configuration = { provider: string; clientId: string; redirectUri: string };
 type Tokens = { access: string; refresh: string; expires: number };
 type SavedSession = { origin: string; config: Configuration; tokens: Tokens };
+type PendingLibrary = {
+    path: string;
+    session: SavedSession;
+    controller: AbortController;
+    result: Promise<{ items: unknown; session: SavedSession }>;
+    readers: number;
+};
 type Callback = { scheme: string; authority: string; path: string; query: string; fragment: string };
 
 export const credentialKey = 'snippet-manager.session';
@@ -74,6 +81,7 @@ export class SignInRequest {
 
 export class AuthClient {
     private queue: Promise<unknown> = Promise.resolve();
+    private pendingLibrary?: PendingLibrary;
 
     constructor(private storage: SecretStorage, private server: () => string, private http = fetch) {}
 
@@ -139,21 +147,91 @@ export class AuthClient {
             if (!saved) {
                 throw new SignInRequired();
             }
-            let session = saved.tokens.expires <= Date.now() + 30_000 ? await this.refresh(saved) : saved;
-            let response = await this.authorized(session.origin, path, session.tokens.access);
-            if (response.status === 401 && session === saved) {
-                session = await this.refresh(saved);
-                response = await this.authorized(session.origin, path, session.tokens.access);
-            }
-            if (response.status === 401) {
-                await this.storage.delete(credentialKey);
-                throw new SignInRequired();
-            }
-            if (!response.ok) {
-                throw new AuthUnavailable('The snippet server is currently unavailable.');
-            }
-            return response;
+            return (await this.authorizeRequest(path, saved)).response;
         });
+    }
+
+    async readLibrary<T>(query: string, signal: AbortSignal): Promise<{ items: T; isCurrent: () => Promise<boolean> }> {
+        const saved = await this.load();
+        signal.throwIfAborted();
+        if (!saved) {
+            throw new SignInRequired();
+        }
+        const path = '/api/snippets' + query;
+        let pending = this.pendingLibrary;
+        if (!pending || pending.path !== path || pending.controller.signal.aborted ||
+                !this.sameSession(pending.session, saved)) {
+            this.cancelLibraryReads();
+            const controller = new AbortController();
+            const result = this.serialize(async () => {
+                controller.signal.throwIfAborted();
+                if (!this.sameSession(saved, await this.load())) {
+                    throw new AuthUnavailable('The Snippo session changed.');
+                }
+                const {response, session} = await this.authorizeRequest(path, saved, controller.signal);
+                const items: unknown = await response.json();
+                if (!this.sameSession(session, await this.load())) {
+                    throw new AuthUnavailable('The Snippo session changed.');
+                }
+                return {items, session};
+            }).finally(() => {
+                if (this.pendingLibrary?.controller === controller) this.pendingLibrary = undefined;
+            });
+            pending = {path, session: saved, controller, result, readers: 0};
+            this.pendingLibrary = pending;
+        }
+        pending.readers++;
+        const entry = pending;
+        try {
+            const {items, session} = await new Promise<Awaited<PendingLibrary['result']>>((resolve, reject) => {
+                const cancel = () => reject(signal.reason);
+                signal.addEventListener('abort', cancel, { once: true });
+                entry.result.then(resolve, reject).finally(() => signal.removeEventListener('abort', cancel));
+            });
+            signal.throwIfAborted();
+            return {items: items as T, isCurrent: async () => this.sameSession(session, await this.load())};
+        } finally {
+            entry.readers--;
+            if (signal.aborted && !entry.readers) {
+                // Give an equivalent picker replacing this one a chance to attach.
+                setTimeout(() => {
+                    if (!entry.readers && this.pendingLibrary === entry) entry.controller.abort();
+                }, 50);
+            }
+        }
+    }
+
+    cancelLibraryReads() {
+        this.pendingLibrary?.controller.abort();
+        this.pendingLibrary = undefined;
+    }
+
+    private sameSession(expected: SavedSession, current?: SavedSession): boolean {
+        return Boolean(current && expected.origin === current.origin &&
+            expected.config.clientId === current.config.clientId && expected.config.provider === current.config.provider &&
+            expected.config.redirectUri === current.config.redirectUri && expected.tokens.expires === current.tokens.expires &&
+            expected.tokens.access === current.tokens.access && expected.tokens.refresh === current.tokens.refresh);
+    }
+
+    private async authorizeRequest(path: string, saved: SavedSession, signal?: AbortSignal) {
+        let session = saved.tokens.expires <= Date.now() + 30_000 ? await this.refresh(saved) : saved;
+        signal?.throwIfAborted();
+        let response = await this.authorized(session.origin, path, session.tokens.access, 'GET', signal);
+        signal?.throwIfAborted();
+        if (response.status === 401 && session === saved) {
+            session = await this.refresh(saved);
+            signal?.throwIfAborted();
+            response = await this.authorized(session.origin, path, session.tokens.access, 'GET', signal);
+            signal?.throwIfAborted();
+        }
+        if (response.status === 401) {
+            if (this.sameSession(session, await this.load())) await this.storage.delete(credentialKey);
+            throw new SignInRequired();
+        }
+        if (!response.ok) {
+            throw new AuthUnavailable('The snippet server is currently unavailable.');
+        }
+        return {response, session};
     }
 
     signOut(): Promise<boolean> {
@@ -207,10 +285,13 @@ export class AuthClient {
                 refresh_token: saved.tokens.refresh,
             });
             const renewed = { ...saved, tokens };
+            if (!this.sameSession(saved, await this.load(true))) {
+                throw new AuthUnavailable('The Snippo session changed.');
+            }
             await this.save(renewed);
             return renewed;
         } catch (error) {
-            if (error instanceof SignInRequired) {
+            if (error instanceof SignInRequired && this.sameSession(saved, await this.load(true))) {
                 await this.storage.delete(credentialKey);
             }
             throw error;
@@ -242,8 +323,8 @@ export class AuthClient {
         return this.authorized(origin, '/api/logout', access, 'POST');
     }
 
-    private authorized(origin: string, path: string, token: string, method = 'GET'): Promise<Response> {
-        return this.send(origin + path, { method, headers: { Authorization: `Bearer ${token}` } });
+    private authorized(origin: string, path: string, token: string, method = 'GET', signal?: AbortSignal): Promise<Response> {
+        return this.send(origin + path, { method, signal, headers: { Authorization: `Bearer ${token}` } });
     }
 
     private async send(url: string, init?: RequestInit): Promise<Response> {

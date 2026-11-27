@@ -6,6 +6,7 @@ const configuration = () => vscode.workspace.getConfiguration('snippetManager');
 const server = () => configuration().get<string>('serverUrl', '');
 
 type Snippet = { name: string; cat: string; code: string };
+type SnippetItem = vscode.QuickPickItem & { code: string };
 type BrowserResult = { code: string } | 'declined' | 'expired' | 'cancelled' | 'launch-failed';
 
 export function activate(context: vscode.ExtensionContext) {
@@ -13,7 +14,8 @@ export function activate(context: vscode.ExtensionContext) {
     const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right);
     let stopSignIn: (() => void) | undefined;
     let callback: ((uri: vscode.Uri) => void) | undefined;
-    let activePicker: vscode.CancellationTokenSource | undefined;
+    let activePicker: vscode.QuickPick<SnippetItem> | undefined;
+    let checkPickerSession: (() => Promise<void>) | undefined;
     let generation = 0;
 
     async function updateStatus() {
@@ -136,7 +138,8 @@ export function activate(context: vscode.ExtensionContext) {
     register('signOut', async () => {
         generation += 1;
         stopSignIn?.();
-        activePicker?.cancel();
+        activePicker?.hide();
+        auth.cancelLibraryReads();
         const revoked = await auth.signOut();
         await updateStatus();
         if (revoked) {
@@ -147,47 +150,64 @@ export function activate(context: vscode.ExtensionContext) {
     });
 
     async function pickSnippets(mode: 'show' | 'search' | 'insert') {
-        if (!await auth.hasSession()) {
-            throw new SignInRequired();
-        }
         const initialGeneration = generation;
         let query = '';
         if (mode === 'search') {
+            if (!await auth.hasSession()) throw new SignInRequired();
+            if (generation !== initialGeneration) return;
             const search = await vscode.window.showInputBox({ placeHolder: 'Search snippets...' });
-            if (search === undefined || generation !== initialGeneration) {
-                return;
-            }
+            if (search === undefined || generation !== initialGeneration) return;
             query = '?' + new URLSearchParams({ search }).toString();
         }
-        const response = await auth.request('/api/snippets' + query);
-        const snippets = await response.json() as Snippet[];
-        if (generation !== initialGeneration) {
-            return;
-        }
-        activePicker?.cancel();
-        const cancellation = new vscode.CancellationTokenSource();
-        activePicker = cancellation;
+
+        activePicker?.hide();
+        const picker = vscode.window.createQuickPick<SnippetItem>();
+        activePicker = picker;
+        checkPickerSession = undefined;
+        picker.placeholder = { show: 'Select a snippet...', search: 'Search results',
+            insert: 'Select a snippet to insert...' }[mode];
+        picker.busy = true;
+        const controller = new AbortController();
+        const signal = controller.signal;
+        let finish: (item?: SnippetItem) => void = () => undefined;
+        const selection = new Promise<SnippetItem | undefined>(resolve => { finish = resolve; });
+        const listeners = [
+            picker.onDidHide(() => { controller.abort(); finish(); }),
+            picker.onDidAccept(() => {
+                if (!picker.busy && picker.selectedItems[0]) finish(picker.selectedItems[0]);
+            }),
+        ];
+        picker.show();
         try {
-            const items = snippets.map(snippet => ({
+            const library = await auth.readLibrary<Snippet[]>(query, signal);
+            if (signal.aborted || generation !== initialGeneration) return;
+            checkPickerSession = async () => {
+                if (!await library.isCurrent() && activePicker === picker) picker.hide();
+            };
+            await checkPickerSession();
+            if (signal.aborted || generation !== initialGeneration) return;
+            picker.items = library.items.map(snippet => ({
                 label: snippet.name, description: snippet.cat, detail: snippet.code, code: snippet.code,
             }));
-            const selected = await vscode.window.showQuickPick(items, {
-                placeHolder: { show: 'Select a snippet...', search: 'Search results', insert: 'Select a snippet to insert...' }[mode],
-            }, cancellation.token);
-            if (mode !== 'insert' || !selected || cancellation.token.isCancellationRequested ||
-                    generation !== initialGeneration) {
-                return;
-            }
+            picker.busy = false;
+            const selected = await selection;
+            if (mode !== 'insert' || !selected || signal.aborted || generation !== initialGeneration ||
+                    !await library.isCurrent() || signal.aborted || generation !== initialGeneration) return;
             const editor = vscode.window.activeTextEditor;
             if (!editor) {
                 void vscode.window.showErrorMessage('No active editor found');
                 return;
             }
             await editor.edit(builder => builder.insert(editor.selection.active, selected.code));
+        } catch (error) {
+            if (!signal.aborted) throw error;
         } finally {
-            cancellation.dispose();
-            if (activePicker === cancellation) {
+            controller.abort();
+            for (const listener of listeners) listener.dispose();
+            picker.dispose();
+            if (activePicker === picker) {
                 activePicker = undefined;
+                checkPickerSession = undefined;
             }
         }
     }
@@ -200,6 +220,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.registerUriHandler({ handleUri: uri => callback?.(uri) }),
         context.secrets.onDidChange(event => {
             if (event.key === credentialKey) {
+                void checkPickerSession?.();
                 void updateStatus();
             }
         }),
@@ -207,11 +228,12 @@ export function activate(context: vscode.ExtensionContext) {
             if (event.affectsConfiguration('snippetManager.serverUrl')) {
                 generation += 1;
                 stopSignIn?.();
-                activePicker?.cancel();
+                activePicker?.hide();
+                auth.cancelLibraryReads();
                 void updateStatus();
             }
         }),
-        { dispose: () => { stopSignIn?.(); activePicker?.cancel(); } },
+        { dispose: () => { stopSignIn?.(); activePicker?.hide(); auth.cancelLibraryReads(); } },
     );
     void updateStatus();
 }

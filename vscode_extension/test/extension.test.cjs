@@ -19,10 +19,33 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
     let openBrowser;
     let changeConfiguration;
     const disposable = () => ({ dispose() {} });
-    class Cancellation {
-        token = { isCancellationRequested: false };
-        cancel() { this.token.isCancellationRequested = true; }
-        dispose() {}
+    let hidePicker;
+    let readyPicker = () => undefined;
+    let waitForList;
+    let revokeList = false;
+    let offline = false;
+    let changedSecret;
+    function createQuickPick() {
+        let accept;
+        let hide;
+        let items = [];
+        const picker = {
+            busy: false,
+            selectedItems: [],
+            get items() { return items; },
+            set items(value) {
+                items = value;
+                picked.push(value);
+                picker.selectedItems = value.slice(0, 1);
+                queueMicrotask(() => accept?.());
+            },
+            onDidHide(fn) { hide = fn; return { dispose() { hide = undefined; } }; },
+            onDidAccept(fn) { accept = fn; return { dispose() { accept = undefined; } }; },
+            show() { hidePicker = () => picker.hide(); readyPicker(picker); },
+            hide() { hide?.(); },
+            dispose() { picker.hide(); },
+        };
+        return picker;
     }
     const vscode = {
         commands: {
@@ -36,7 +59,6 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
         Uri: { parse: value => new URL(value) },
         StatusBarAlignment: { Right: 2 },
         ProgressLocation: { Notification: 3 },
-        CancellationTokenSource: Cancellation,
         workspace: {
             getConfiguration: () => ({ get: () => origin }),
             onDidChangeConfiguration: listener => { changeConfiguration = listener; return disposable(); },
@@ -48,7 +70,7 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
             showWarningMessage: async message => { messages.push(message); },
             showErrorMessage: async message => { messages.push(message); },
             showInputBox: async () => 'cat + &',
-            showQuickPick: async items => { picked.push(items); return items[0]; },
+            createQuickPick,
             activeTextEditor: {
                 selection: { active: { line: 0, character: 0 } },
                 edit: async callback => { callback({ insert: (_position, code) => { inserted = code; } }); return true; },
@@ -76,7 +98,7 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
             get: async key => secret.get(key),
             store: async (key, value) => { secret.set(key, value); },
             delete: async key => { secret.delete(key); },
-            onDidChange: disposable,
+            onDidChange(listener) { changedSecret = listener; return disposable(); },
         },
     };
     t.mock.method(global, 'fetch', async (url, init) => {
@@ -84,12 +106,19 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
         requested.push(target);
         if (target.pathname === '/oauth/vscode/config') { return Response.json(config); }
         if (target.pathname.endsWith('/token')) {
+            if (init.body.get('grant_type') === 'refresh_token') {
+                if (revokeList) return new Response(null, { status: 401 });
+                return Response.json({ access_token: 'access', refresh_token: 'refresh', expires_in: 3600 });
+            }
             assert.equal(init.body.get('code'), 'browser-fixture');
             assert.ok(init.body.get('code_verifier'));
             return Response.json({ access_token: 'access', refresh_token: 'refresh', expires_in: 3600 });
         }
         assert.equal(init.headers.Authorization, 'Bearer access');
         if (target.pathname.endsWith('/logout')) { return new Response(null, { status: 204 }); }
+        if (waitForList) await waitForList(init.signal);
+        if (offline) throw new Error('Offline');
+        if (revokeList) return new Response(null, { status: 401 });
         return Response.json([{ name: 'Snippet fixture', cat: 'Test', code: 'print(5)' }]);
     });
     const load = Module._load;
@@ -169,6 +198,65 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
     assert.equal(requested.find(request => request.search).searchParams.get('search'), 'cat + &');
     assert.equal(inserted, 'print(5)');
 
+    let release;
+    waitForList = () => new Promise(resolve => { release = resolve; });
+    let busyShown = 0;
+    readyPicker = picker => {
+        assert.equal(picker.busy, true);
+        assert.deepEqual(picker.items, []);
+        busyShown++;
+    };
+    const overlappingStart = requested.length;
+    const first = run('showSnippets');
+    await new Promise(setImmediate);
+    assert.equal(typeof release, 'function');
+    const second = run('showSnippets');
+    await new Promise(setImmediate);
+    release();
+    await Promise.all([first, second]);
+    assert.equal(requested.length - overlappingStart, 1);
+    assert.equal(busyShown, 2);
+    assert.equal(picked.length, 4);
+
+    const cancelled = run('showSnippets');
+    await new Promise(setImmediate);
+    hidePicker();
+    release();
+    await cancelled;
+    await new Promise(setImmediate);
+    assert.equal(picked.length, 4);
+
+    const storageSnapshot = secret.get(credentialKey);
+    const switched = run('showSnippets');
+    await new Promise(setImmediate);
+    const other = JSON.parse(storageSnapshot);
+    other.tokens.access = 'another-account-access';
+    secret.set(credentialKey, JSON.stringify(other));
+    changedSecret({ key: credentialKey });
+    release();
+    await switched;
+    assert.equal(picked.length, 4);
+    secret.set(credentialKey, storageSnapshot);
+    waitForList = undefined;
+
+    offline = true;
+    await run('showSnippets');
+    assert.match(messages.at(-1), /Could not complete/);
+    assert.equal(picked.length, 4);
+    offline = false;
+
+    const renewed = JSON.parse(storageSnapshot);
+    renewed.tokens.expires = 0;
+    secret.set(credentialKey, JSON.stringify(renewed));
+    await run('showSnippets');
+    assert.equal(picked.length, 5);
+    revokeList = true;
+    await run('showSnippets');
+    assert.equal(picked.length, 5);
+    assert.equal(secret.size, 0);
+    assert.match(messages.at(-1), /Sign in/);
+    revokeList = false;
+    secret.set(credentialKey, storageSnapshot);
     await run('signOut');
     assert.equal(secret.size, 0);
     const before = requested.length;

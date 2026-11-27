@@ -1,0 +1,17 @@
+{% macro form_token() -%}
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+{%- endmacro %}
+{% macro confirmation(label, prompt, endpoint, sno=none) %}
+    <details class="confirmation">
+        <summary>{{ label }}</summary>
+        <form method="post" {% if endpoint == 'delete' %}data-library-write{% endif %} action="{{ url_for(endpoint, sno=sno, **selection) }}">
+            {{ form_token() }}
+            {% if endpoint == 'auth.revoke_vscode_grant' %}<input type="hidden" name="dashboard" value="1">{% endif %}
+            <p>{{ prompt }}</p>
+            <div class="form-actions">
+                <button class="quiet" type="button" data-close hidden>Cancel</button>
+                <button class="danger" type="submit">{{ label }}</button>
+            </div>
+        </form>
+    </details>
+{% endmacro %}

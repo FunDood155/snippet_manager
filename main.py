@@ -13,6 +13,9 @@ from snippet_highlighting import highlight
 
 load_dotenv()
 
+PAGE_SIZE = 40
+FRAGMENT_HEADER = "X-Snippo-Fragment"
+
 
 def valid_origin(value, allow_local_http):
     try:
@@ -48,6 +51,7 @@ def create_app(config=None):
     if config:
         app.config.update(config)
     app.register_blueprint(auth.bp)
+    app.teardown_request(store.close_request_connection)
     app.jinja_env.globals["csrf_token"] = auth.csrf_token
     app.jinja_env.filters["highlight_snippet"] = highlight
     editor_endpoints = {"edit", "duplicate"}
@@ -85,7 +89,8 @@ def create_app(config=None):
             if request.endpoint in {"auth.confirm_email", "auth.reset_password", "auth.vscode_callback"}:
                 response.headers["Content-Security-Policy"] += "; script-src 'self'"
             if request.endpoint in library_endpoints:
-                response.headers["Content-Security-Policy"] += "; script-src 'self'; img-src 'self'"
+                response.headers["Content-Security-Policy"] += "; script-src 'self'; img-src 'self'; connect-src 'self'"
+                response.vary.add(FRAGMENT_HEADER)
         return response
 
     @app.errorhandler(auth.AuthError)
@@ -135,19 +140,32 @@ def create_app(config=None):
             selection["sort"] = sort
         return selection
 
-    def library_page(draft=None, error=None, unavailable=False, status=200, editor="add", source_id=None):
+    def is_fragment():
+        return request.headers.get(FRAGMENT_HEADER) == "library"
+
+    def library_page(draft=None, error=None, unavailable=False, status=200, editor="add",
+                     source_id=None, manage=None, reset_page=False):
         selection = filters()
-        snippets, categories, hidden = [], [], []
+        page = 1 if reset_page else min(2_147_483_647, max(1, request.args.get("page", 1, type=int)))
+        snippets, categories, hidden, total, revision = [], [], [], 0, None
         if not unavailable:
-            snippets, categories = store.list_snippets(g.owner, **selection, include_categories=True,
-                                                       include_favorites=True)
-            hidden = store.hidden_defaults(g.owner)
-        return render_template("index.html", snippets=snippets, categories=categories,
-                               default_id_min=store.DEFAULT_ID_MIN, selection=selection, hidden=hidden,
-                               manage_hidden=request.args.get("manage") == "1", draft=draft, error=error,
-                               unavailable=unavailable, editor=editor, source_id=source_id), status
+            snippets, categories, hidden, total, page, revision = store.library_page(
+                g.owner, page, PAGE_SIZE, revision=request.args.get("revision"), **selection)
+        manage = request.args.get("manage") == "1" if manage is None else manage
+        location = url_for("home" if editor == "add" else editor, sno=source_id, **selection,
+                           page=page if page > 1 else None, revision=revision if page > 1 else None,
+                           manage=1 if manage else None,
+                           _anchor="hidden-defaults" if manage else None)
+        template = "library_fragment.html" if is_fragment() else "index.html"
+        return render_template(template, snippets=snippets, categories=categories, total=total,
+                               page=page, pages=max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE), revision=revision,
+                               library_location=location, default_id_min=store.DEFAULT_ID_MIN,
+                               selection=selection, hidden=hidden, manage_hidden=manage, draft=draft,
+                               error=error, unavailable=unavailable, editor=editor, source_id=source_id), status
 
     def library_redirect(manage=False):
+        if is_fragment():
+            return library_page(manage=manage, reset_page=True)
         return redirect(url_for("home", **filters(), manage=1 if manage else None,
                                 _anchor="hidden-defaults" if manage else None), code=303)
 
