@@ -38,6 +38,7 @@ MIGRATION = next((ROOT / "supabase/migrations").glob("*_snippet_ownership.sql"))
 STARTER_MIGRATION = next((ROOT / "supabase/migrations").glob("*_default_starter_snippets.sql")).read_text()
 PUBLIC_AUTH = next((ROOT / "supabase/migrations").glob("*_public_authentication.sql")).read_text()
 SHARED_DEFAULTS = next((ROOT / "supabase/migrations").glob("*_shared_default_snippets.sql")).read_text()
+HIDDEN_DEFAULTS = next((ROOT / "supabase/migrations").glob("*_hidden_default_snippets.sql")).read_text()
 RETIRE_STARTERS = next((ROOT / "supabase/migrations").glob("*_retire_starter_copies.sql")).read_text()
 PUBLIC_UNDO = (ROOT / "supabase/rollback_public_authentication.sql").read_text()
 STARTER_UNDO = (ROOT / "supabase/rollback_starter_snippets.sql").read_text()
@@ -206,6 +207,7 @@ class AppTest(unittest.TestCase):
                 cur.execute("INSERT INTO auth.users (id) VALUES (%s)", (HELD,))
                 cur.execute(PUBLIC_AUTH)
                 cur.execute(SHARED_DEFAULTS)
+                cur.execute(HIDDEN_DEFAULTS)
                 cur.execute("DELETE FROM snippet_private.legacy_email_holds WHERE user_id IN (%s, %s)", (A, B))
                 cur.execute("ALTER ROLE snippet_app LOGIN PASSWORD 'fixture-only'")
 
@@ -213,6 +215,7 @@ class AppTest(unittest.TestCase):
         with closing(psycopg2.connect(self.admin)) as conn:
             with conn, conn.cursor() as cur:
                 cur.execute("DELETE FROM public.snippets WHERE owner_id IS NOT NULL")
+                cur.execute("DELETE FROM snippet_private.hidden_default_snippets")
                 cur.execute("""TRUNCATE snippet_private.web_sessions, snippet_private.auth_limits,
                     snippet_private.revoked_vscode_sessions, snippet_private.session_cutoffs, snippet_private.email_flows""")
         patches = (patch.dict(os.environ, {"SNIPPET_DATABASE_URL": self.runtime}),
@@ -765,6 +768,133 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.browser.post("/api/logout", headers=self.api_b).status_code, 204)
         self.assertEqual(self.browser.get(url, headers=self.api_b).status_code, 401)
 
+    def test_dashboard_combines_filters_and_preserves_invalid_drafts(self):
+        self.login()
+        self.api_create(self.api_a, name="Other personal", cat="Basics", code="# match & code")
+        self.api_create(self.api_b, name="Secret", cat="Basics", code="# match & code")
+        filters = "?search=match&category=Basics&scope=personal"
+        page = self.browser.get("/" + filters)
+        self.assertIn(b"Other personal", page.data)
+        self.assertNotIn(b"Secret", page.data)
+        self.assertNotIn(b"Hello World", page.data)
+        self.assertIn(b"Clear filters", page.data)
+        self.assertIn(b'scope=defaults&amp;search=match&amp;category=Basics', page.data)
+        self.assertIn(b"No matching snippets", self.browser.get("/?search=match&category=Basics&scope=defaults").data)
+        token = csrf(self.browser, "/")
+        form = {"csrf_token": token, "name": "Draft title", "cat": "Basics", "code": " "}
+        invalid = self.browser.post("/add" + filters, data=form)
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn(b'value="Draft title"', invalid.data)
+        self.assertIn(b'role="alert"', invalid.data)
+        self.assertIn(b"class=\"composer\" open", invalid.data)
+        self.assertNotIn(b"Snippet added.", invalid.data)
+        form["code"] = "# match & <code>"
+        with patch("store.add_snippet", side_effect=psycopg2.OperationalError):
+            failed = self.browser.post("/add" + filters, data=form)
+        self.assertEqual(failed.status_code, 503)
+        self.assertIn(b"match &amp; &lt;code&gt;", failed.data)
+        self.assertNotIn(b"Snippet added.", failed.data)
+        saved = self.browser.post("/add" + filters, data=form)
+        self.assertEqual(saved.location, "/" + filters)
+        self.assertIn(b"Snippet added.", self.browser.get(saved.location).data)
+        self.assertNotIn(b"Snippet added.", self.browser.get(saved.location).data)
+        self.assertIn("img-src 'self'", page.headers["Content-Security-Policy"])
+        self.assertNotIn("img-src", self.browser.get("/login").headers["Content-Security-Policy"])
+
+    def test_hide_restore_and_restore_all_are_account_scoped(self):
+        self.login()
+        token = csrf(self.browser, "/")
+        default = store.DEFAULT_ID_MIN
+        api = f"/api/snippets/{default}"
+        hide = f"/defaults/{default}/hide"
+        self.assertEqual(self.browser.post(hide).status_code, 400)
+        for _ in range(2):
+            hidden = self.browser.post(hide, data={"csrf_token": token, "user_id": B}, follow_redirects=True)
+            self.assertIn(b"Default hidden.", hidden.data)
+        self.assertEqual(self.browser.get(api, headers=self.api_a).status_code, 404)
+        self.assertEqual(self.browser.get(api, headers=self.api_b).status_code, 200)
+        self.assertEqual(self.browser.get("/api/snippets?search=Hello%20World", headers=self.api_a).json, [])
+        self.assertEqual(self.browser.get("/api/snippets?search=Hello%20World", headers=self.api_b).json[0]["sno"], default)
+        self.assertEqual(self.browser.post("/defaults/17/hide", data={"csrf_token": token}).status_code, 404)
+        self.assertEqual(self.browser.post("/defaults/2147483648/restore", data={"csrf_token": token}).status_code, 404)
+        other_browser = self.app.test_client()
+        other_browser.post("/login", data={"csrf_token": csrf(other_browser, "/login"),
+                                            "email": "a@sample.test", "password": PASSWORD})
+        self.assertIn(b"Hidden defaults (1)", other_browser.get("/?scope=defaults").data)
+        for _ in range(2):
+            restored = self.browser.post(f"/defaults/{default}/restore?scope=defaults", data={"csrf_token": token},
+                                         follow_redirects=True)
+            self.assertIn(b"Default restored.", restored.data)
+        self.assertEqual(self.browser.get(api, headers=self.api_a).status_code, 200)
+        for sno in range(default, default + 4):
+            self.browser.post(f"/defaults/{sno}/hide", data={"csrf_token": token})
+        self.assertIn(b"No visible defaults", self.browser.get("/?scope=defaults").data)
+        self.assertTrue(store.hide_default(B, default))
+        restored = self.browser.post("/defaults/restore-all", data={"csrf_token": token}, follow_redirects=True)
+        self.assertIn(b"All defaults restored.", restored.data)
+        self.assertEqual(self.browser.get(api, headers=self.api_b).status_code, 404)
+        self.assertEqual(len(self.browser.get("/api/snippets", headers=self.api_a).json), 4)
+
+    def test_dashboard_account_feedback_reports_revocation_outcome(self):
+        self.login()
+        form = {"csrf_token": csrf(self.browser, "/"), "dashboard": "1"}
+        endpoint = "/oauth/vscode/revoke?scope=defaults"
+        provider_fixture = auth.provider
+
+        def reject_revocation(method, path, **kwargs):
+            if method == "DELETE" and path.startswith("/user/oauth/grants?"):
+                raise auth.AuthError(503)
+            return provider_fixture(method, path, **kwargs)
+
+        with patch("auth.provider", side_effect=reject_revocation):
+            failed = self.browser.post(endpoint, data=form, follow_redirects=True)
+        self.assertIn(b"Could not confirm that VS Code sessions were revoked.", failed.data)
+        self.assertNotIn(b"All VS Code sessions revoked.", failed.data)
+        finished = self.browser.post(endpoint, data=form, follow_redirects=True)
+        self.assertIn(b"All VS Code sessions revoked.", finished.data)
+        self.assertIn(b'name="scope" value="defaults"', finished.data)
+        signed_out = self.browser.post("/logout", data=form, follow_redirects=True)
+        self.assertIn(b"Signed out of Snippo.", signed_out.data)
+
+    def test_preference_rls_grants_and_fk_cascade(self):
+        table = "snippet_private.hidden_default_snippets"
+        self.assertTrue(store.hide_default(A, store.DEFAULT_ID_MIN))
+        with store.cursor(B) as cur:
+            cur.execute(f"SELECT count(*) FROM {table}")
+            self.assertEqual(cur.fetchone(), (0,))
+            cur.execute(f"DELETE FROM {table} WHERE user_id = %s", (A,))
+            self.assertEqual(cur.rowcount, 0)
+            with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+                cur.execute(f"INSERT INTO {table} VALUES (%s, %s)", (A, store.DEFAULT_ID_MIN + 1))
+        with store.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {table}")
+            self.assertEqual(cur.fetchone(), (0,))
+        with closing(psycopg2.connect(self.admin)) as conn, conn.cursor() as cur:
+            for role in ("anon", "authenticated", "service_role"):
+                cur.execute("SELECT has_table_privilege(%s, %s, 'SELECT,INSERT,UPDATE,DELETE')", (role, table))
+                self.assertFalse(cur.fetchone()[0])
+            cur.execute("SELECT has_table_privilege('snippet_app', %s, 'UPDATE')", (table,))
+            self.assertFalse(cur.fetchone()[0])
+            user = str(uuid4())
+            cur.execute("INSERT INTO auth.users (id) VALUES (%s)", (user,))
+            cur.execute("INSERT INTO public.default_snippets (name,cat,code) VALUES ('New template','Fixture','code') RETURNING sno")
+            fresh = cur.fetchone()[0]
+            cur.execute(f"INSERT INTO {table} VALUES (%s,%s), (%s,%s)", (user, store.DEFAULT_ID_MIN, A, fresh))
+            cur.execute("DELETE FROM auth.users WHERE id=%s", (user,))
+            cur.execute("DELETE FROM public.default_snippets WHERE sno=%s", (fresh,))
+            cur.execute(f"SELECT user_id::text,snippet_id FROM {table}")
+            self.assertEqual(cur.fetchall(), [(A, store.DEFAULT_ID_MIN)])
+            conn.rollback()
+        with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+            cur.execute("INSERT INTO public.default_snippets (name,cat,code) VALUES ('New template','Fixture','code') RETURNING sno")
+            added = cur.fetchone()[0]
+        def remove_fixture():
+            with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM public.default_snippets WHERE sno=%s", (added,))
+        self.addCleanup(remove_fixture)
+        for headers in (self.api_a, self.api_b):
+            self.assertEqual(self.browser.get(f"/api/snippets/{added}", headers=headers).status_code, 200)
+
     def test_default_database_privileges_and_id_bounds(self):
         with store.cursor() as cur:
             cur.execute("SELECT count(*) FROM public.default_snippets")
@@ -955,6 +1085,7 @@ class AppTest(unittest.TestCase):
         ownership_rollback = UNDO.strip().removeprefix("BEGIN;").removesuffix("COMMIT;")
         public_rollback = PUBLIC_UNDO.split("BEGIN;", 1)[1].removesuffix("COMMIT;\n")
         rollback_body = (
+            "DROP TABLE snippet_private.hidden_default_snippets;"
             "DROP TABLE public.default_snippets;"
             "ALTER TABLE public.snippets DROP CONSTRAINT snippets_personal_id_range;"
             "ALTER SEQUENCE public.snippets_sno_seq MAXVALUE 2147483647;"

@@ -19,3 +19,24 @@ In the Supabase Table Editor, an authorized database operator can add or edit a 
 The cleanup transaction records the full before-images in `snippet_private.wp04_snippet_archive`. It is outside the exposed schema, with RLS enabled and no app or Data API grants. Restrict access to database operators and retain it only as needed for rollback and applicable account deletion requests.
 
 Prefer fixing forward. The deployed backend depends on `public.default_snippets`. Before rolling back to old provisioning, validate the archive against the reviewed IDs and fingerprints and confirm that original non-null owners still exist and IDs are free. Under the same lock ordering, restore only reviewed rows from the archive with `jsonb_populate_record(NULL::public.snippets, original_row)` and explicit column mapping. Do not use conflict handling to overwrite or silently skip data. Leave both sequences intact and verify the personal sequence is ahead of restored IDs. Rehearse restoring the original function, policy and scoped grants from the starter migration without replaying its role or table creation statements. Enable old provisioning only in a coordinated rollback after validating the restored data and old backend. Keep the shared table until the deployed backend no longer reads it.
+
+## Per-account visibility and web dashboard
+
+The web library offers **Hide default** on shared cards and **Hidden defaults**
+for individual restore and restore-all. A hidden default disappears from that
+account's list, search, and detail responses, including in VS Code. Preferences
+follow the account across devices and never modify a shared row. New shared
+defaults are visible until an account chooses to hide them.
+
+Before deploying this backend, apply
+`supabase/migrations/20261127201346_hidden_default_snippets.sql` to the target
+database. It adds an initially empty, private preference table with forced
+owner-scoped RLS and SELECT, INSERT, and DELETE grants for `snippet_app`.
+Both foreign keys cascade into preferences only. Verify the migration in an
+isolated database before any Production cutover. A Preview requires a
+compatible migrated test database for authenticated library pages.
+
+The previous backend can run with the preference table in place. During that
+rollback, hidden defaults become visible until the new backend is redeployed.
+Keep the table and its rows so preferences survive rollback. Do not drop the
+table while any deployed backend still reads it.

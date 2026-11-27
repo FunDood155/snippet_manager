@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 
 import psycopg2
 from dotenv import load_dotenv
-from flask import Flask, abort, g, jsonify, redirect, render_template, request, url_for
+from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, url_for
 
 import auth
 import store
@@ -48,6 +48,7 @@ def create_app(config=None):
         app.config.update(config)
     app.register_blueprint(auth.bp)
     app.jinja_env.globals["csrf_token"] = auth.csrf_token
+    library_endpoints = {"home", "add", "delete", "hide_default", "restore_default", "restore_defaults"}
 
     @app.before_request
     def authorize():
@@ -62,7 +63,7 @@ def create_app(config=None):
             g.owner = auth.api_identity()
         elif request.method == "POST":
             auth.protect_form()
-        if request.endpoint in {"home", "add", "delete", "account_deletion"}:
+        if request.endpoint in library_endpoints | {"account_deletion"}:
             g.owner = auth.web_identity()
             if not g.owner:
                 return redirect(url_for("auth.login"), code=303)
@@ -79,6 +80,8 @@ def create_app(config=None):
             )
             if request.endpoint in {"auth.confirm_email", "auth.reset_password", "auth.vscode_callback"}:
                 response.headers["Content-Security-Policy"] += "; script-src 'self'"
+            if request.endpoint in library_endpoints:
+                response.headers["Content-Security-Policy"] += "; script-src 'self'; img-src 'self'"
         return response
 
     @app.errorhandler(auth.AuthError)
@@ -93,6 +96,10 @@ def create_app(config=None):
 
     @app.errorhandler(psycopg2.Error)
     def database_error(_error):
+        if request.endpoint in library_endpoints and getattr(g, "owner", None):
+            draft = request.form if request.endpoint == "add" else None
+            return library_page(draft=draft, error="The library is temporarily unavailable. Try again shortly.",
+                                unavailable=True, status=503)
         return service_error(503)
 
     def service_error(status):
@@ -108,13 +115,34 @@ def create_app(config=None):
             return response, status
         return render_template("service_error.html", message=message), status
 
+    def filters():
+        search = request.args.get("search", "")
+        category = request.args.get("category", "")
+        scope = request.args.get("scope", "all")
+        return {
+            "search": search if "\x00" not in search else "",
+            "category": category if "\x00" not in category else "",
+            "scope": scope if scope in ("all", "personal", "defaults") else "all",
+        }
+
+    def library_page(draft=None, error=None, unavailable=False, status=200):
+        selection = filters()
+        snippets, categories, hidden = [], [], []
+        if not unavailable:
+            snippets, categories = store.list_snippets(g.owner, **selection, include_categories=True)
+            hidden = store.hidden_defaults(g.owner)
+        return render_template("index.html", snippets=snippets, categories=categories,
+                               default_id_min=store.DEFAULT_ID_MIN, selection=selection, hidden=hidden,
+                               manage_hidden=request.args.get("manage") == "1", draft=draft, error=error,
+                               unavailable=unavailable), status
+
+    def library_redirect(manage=False):
+        return redirect(url_for("home", **filters(), manage=1 if manage else None,
+                                _anchor="hidden-defaults" if manage else None), code=303)
+
     @app.get("/")
     def home():
-        snippets, categories = store.list_snippets(
-            g.owner, request.args.get("search"), request.args.get("category"), include_categories=True,
-        )
-        return render_template("index.html", snippets=snippets, categories=categories,
-                               default_id_min=store.DEFAULT_ID_MIN)
+        return library_page()
 
     @app.get("/account/deletion")
     def account_deletion():
@@ -124,15 +152,38 @@ def create_app(config=None):
     def add():
         fields, error = snippet_fields(request.form)
         if error:
-            abort(400, error)
+            return library_page(draft=request.form, error=error, status=400)
         store.add_snippet(g.owner, *fields)
-        return redirect(url_for("home"), code=303)
+        flash("Snippet added.", "library-success")
+        return library_redirect()
 
     @app.post("/delete/<int:sno>")
     def delete(sno):
         if not valid_id(sno) or not store.delete_snippet(g.owner, sno):
-            abort(404)
-        return redirect(url_for("home"), code=303)
+            return library_page(error="Personal snippet not found.", status=404)
+        flash("Snippet deleted.", "library-success")
+        return library_redirect()
+
+    @app.post("/defaults/<int:sno>/hide")
+    def hide_default(sno):
+        if not store.DEFAULT_ID_MIN <= sno <= 2147483647 or not store.hide_default(g.owner, sno):
+            return library_page(error="Shared default not found.", status=404)
+        flash("Default hidden. Restore it under Hidden defaults.", "library-success")
+        return library_redirect()
+
+    @app.post("/defaults/<int:sno>/restore")
+    def restore_default(sno):
+        if not store.DEFAULT_ID_MIN <= sno <= 2147483647 or not store.restore_default(g.owner, sno):
+            return library_page(error="Shared default not found.", status=404)
+        flash("Default restored.", "library-success")
+        return library_redirect(manage=True)
+
+    @app.post("/defaults/restore-all")
+    def restore_defaults():
+        count = store.restore_all_defaults(g.owner)
+        flash("All defaults restored." if count else "There are no hidden defaults to restore.",
+              "library-success" if count else "library-info")
+        return library_redirect(manage=True)
 
     @app.get("/api/snippets")
     def get_snippets():

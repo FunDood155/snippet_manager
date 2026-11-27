@@ -8,6 +8,7 @@ import time
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import UUID
 
+import psycopg2
 import requests
 from flask import (
     Blueprint, abort, current_app, flash, g, jsonify, redirect, render_template, request, session, url_for,
@@ -223,9 +224,21 @@ def revoke_vscode_grant():
     if not owner:
         return redirect(url_for("auth.login"), code=303)
     path = "/user/oauth/grants?" + urlencode({"client_id": vscode_client()})
-    provider("DELETE", path, token=g.web_token)
-    with store.cursor() as cur:
-        cur.execute("DELETE FROM snippet_private.revoked_vscode_sessions WHERE user_id = %s", (owner,))
+    dashboard = request.form.get("dashboard") == "1"
+    try:
+        provider("DELETE", path, token=g.web_token)
+        with store.cursor() as cur:
+            cur.execute("DELETE FROM snippet_private.revoked_vscode_sessions WHERE user_id = %s", (owner,))
+    except (AuthError, psycopg2.Error):
+        if not dashboard:
+            raise
+        flash("Could not confirm that VS Code sessions were revoked. Try again.", "library-error")
+    else:
+        if dashboard:
+            flash("All VS Code sessions revoked.", "library-success")
+    if dashboard:
+        return redirect(url_for("home", search=request.args.get("search"), category=request.args.get("category"),
+                                scope=request.args.get("scope")), code=303)
     return render_template("auth.html", mode="revoked")
 
 
@@ -492,6 +505,8 @@ def logout():
         session.clear()
     if not revoked:
         return auth_page("login", "Signed out here. The provider could not confirm revocation.", 503)
+    if request.form.get("dashboard") == "1":
+        flash("Signed out of Snippo.", "registration")
     return redirect(url_for("auth.login"), code=303)
 
 
