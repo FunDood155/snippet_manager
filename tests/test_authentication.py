@@ -37,6 +37,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = next((ROOT / "supabase/migrations").glob("*_snippet_ownership.sql")).read_text()
 STARTER_MIGRATION = next((ROOT / "supabase/migrations").glob("*_default_starter_snippets.sql")).read_text()
 PUBLIC_AUTH = next((ROOT / "supabase/migrations").glob("*_public_authentication.sql")).read_text()
+SHARED_DEFAULTS = next((ROOT / "supabase/migrations").glob("*_shared_default_snippets.sql")).read_text()
+RETIRE_STARTERS = next((ROOT / "supabase/migrations").glob("*_retire_starter_copies.sql")).read_text()
 PUBLIC_UNDO = (ROOT / "supabase/rollback_public_authentication.sql").read_text()
 STARTER_UNDO = (ROOT / "supabase/rollback_starter_snippets.sql").read_text()
 STARTERS = {
@@ -202,6 +204,7 @@ class AppTest(unittest.TestCase):
                 cur.execute("RESET ROLE")
                 cur.execute("INSERT INTO auth.users (id) VALUES (%s)", (HELD,))
                 cur.execute(PUBLIC_AUTH)
+                cur.execute(SHARED_DEFAULTS)
                 cur.execute("DELETE FROM snippet_private.legacy_email_holds WHERE user_id IN (%s, %s)", (A, B))
                 cur.execute("ALTER ROLE snippet_app LOGIN PASSWORD 'fixture-only'")
 
@@ -254,7 +257,7 @@ class AppTest(unittest.TestCase):
                 self.assertIn(copy, notice.data)
             self.assertNotIn(email.encode(), notice.data)
         owner = auth.provider.pending[email]
-        self.assertEqual(store.list_snippets(owner)[0], [])
+        self.assertEqual(self.personal_snippets(owner), [])
         pending_token = fake_jwt(owner, str(uuid4()))
         with patch("auth.provider", return_value={"sub": owner, "email_verified": False}):
             self.assertEqual(self.browser.get("/api/snippets", headers=bearer(pending_token)).status_code, 401)
@@ -264,7 +267,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.form("/login", email=email, password="other-password").status_code, 401)
         self.assertEqual(self.form("/login", email=email, password=password).status_code, 303)
         owner = auth.provider.confirmed[email]
-        snippets, _ = store.list_snippets(owner)
+        snippets = self.personal_snippets(owner)
         self.assertEqual({row[1]: row[2] for row in snippets}, STARTERS)
         self.assertEqual(len(snippets), 4)
         self.assertIn(b"Hello World", self.browser.get("/").data)
@@ -666,17 +669,149 @@ class AppTest(unittest.TestCase):
             "UPDATE auth.users SET email_confirmed_at = coalesce(email_confirmed_at, now()) WHERE id = %s", (user,),
         )
 
+    def personal_snippets(self, owner):
+        with store.cursor(owner) as cur:
+            cur.execute("SELECT sno, name, cat, code FROM public.snippets WHERE owner_id = %s ORDER BY sno", (owner,))
+            return cur.fetchall()
+
+    def test_shared_defaults_are_filtered_read_only_and_keep_the_api_shape(self):
+        a = self.browser.get("/api/snippets", headers=self.api_a).json
+        self.assertEqual(a, self.browser.get("/api/snippets", headers=self.api_b).json)
+        self.assertEqual({row["name"]: row["cat"] for row in a}, STARTERS)
+        self.assertEqual(len(a), 4)
+        hello = next(row for row in a if row["name"] == "Hello World")
+        self.assertEqual(set(hello), {"sno", "name", "cat", "code"})
+        self.assertEqual(hello["sno"], store.DEFAULT_ID_MIN)
+        self.assertEqual(self.browser.get("/api/snippets?category=Basics&search=print", headers=self.api_b).json,
+                         [hello])
+        url = f"/api/snippets/{hello['sno']}"
+        self.assertEqual(self.browser.get(url, headers=self.api_b).json, hello)
+        self.assertEqual(self.browser.get(url).status_code, 401)
+        self.assertEqual(self.browser.delete(url, headers=self.api_a).status_code, 404)
+        personal = self.api_create(self.api_a, name=hello["name"]).json
+        self.assertLess(personal["sno"], store.DEFAULT_ID_MIN)
+        self.assertEqual(self.browser.get(f"/api/snippets/{personal['sno']}", headers=self.api_b).status_code, 404)
+        self.login()
+        page = self.browser.get("/").data
+        self.assertIn(b"Shared default", page)
+        self.assertIn(b"Basics", page)
+        self.assertNotIn(f'/delete/{hello["sno"]}'.encode(), page)
+        self.assertEqual(self.browser.post(f'/delete/{hello["sno"]}', data={
+            "csrf_token": csrf(self.browser, "/"),
+        }).status_code, 404)
+        self.assertEqual(self.browser.post("/api/logout", headers=self.api_b).status_code, 204)
+        self.assertEqual(self.browser.get(url, headers=self.api_b).status_code, 401)
+
+    def test_default_database_privileges_and_id_bounds(self):
+        with store.cursor() as cur:
+            cur.execute("SELECT count(*) FROM public.default_snippets")
+            self.assertEqual(cur.fetchone(), (0,))
+        with store.cursor(A) as cur:
+            cur.execute("SELECT count(*) FROM public.default_snippets")
+            self.assertEqual(cur.fetchone(), (4,))
+            with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+                cur.execute("DELETE FROM public.default_snippets")
+        with closing(psycopg2.connect(self.admin)) as conn, conn.cursor() as cur:
+            for role in ("anon", "authenticated", "service_role"):
+                cur.execute("SELECT has_table_privilege(%s, 'public.default_snippets', 'SELECT,INSERT,UPDATE,DELETE')",
+                            (role,))
+                self.assertFalse(cur.fetchone()[0])
+            with self.assertRaises(psycopg2.errors.CheckViolation):
+                cur.execute("INSERT INTO public.snippets VALUES (%s, 'x', 'x', 'x', %s)", (store.DEFAULT_ID_MIN, A))
+            conn.rollback()
+            cur.execute("INSERT INTO public.default_snippets (name, cat, code) VALUES ('x', 'x', 'x') RETURNING sno")
+            self.assertGreater(cur.fetchone()[0], store.DEFAULT_ID_MIN)
+            conn.rollback()
+
+    def test_cleanup_revalidates_scope_and_archives_only_reviewed_rows(self):
+        legacy_ids = [1, 2, 3, 9, 10, 11, 14, 15, 16]
+        seed_groups = ([43, 44, 45, 46], [47, 48, 49, 50], [52, 53, 54, 55])
+        owners = [A, B, HELD]
+        cleanup = RETIRE_STARTERS.strip().removeprefix("BEGIN;").removesuffix("COMMIT;")
+        with closing(psycopg2.connect(self.admin)) as conn, conn.cursor() as cur:
+            cur.execute("INSERT INTO public.snippets (sno,name,cat,code) SELECT id,'old','test','old' FROM unnest(%s) id",
+                        (legacy_ids,))
+            for owner, group in zip(owners, seed_groups):
+                cur.execute("""
+                    INSERT INTO public.snippets (sno,name,cat,code,owner_id)
+                    SELECT chosen.id, d.name, d.cat, d.code, %s
+                    FROM unnest(%s) WITH ORDINALITY AS chosen(id, n)
+                    JOIN public.default_snippets d ON d.sno = %s + chosen.n - 1
+                """, (owner, group, store.DEFAULT_ID_MIN))
+            cur.execute("""
+                INSERT INTO public.snippets (sno,name,cat,code,owner_id) VALUES (51,'Functions','coding','keep',%s);
+                INSERT INTO public.snippets (sno,name,cat,code,owner_id)
+                SELECT 56,name,cat,code,%s FROM public.default_snippets WHERE sno = %s
+            """, (A, B, store.DEFAULT_ID_MIN))
+            ids = legacy_ids + [sno for group in seed_groups for sno in group]
+            cur.execute("""
+                SELECT jsonb_build_object(
+                    'candidates', jsonb_object_agg(sno, hash) FILTER (WHERE sno <> 51),
+                    'protected', max(hash) FILTER (WHERE sno = 51)
+                )::text
+                FROM (
+                    SELECT s.sno, encode(sha256(convert_to(to_jsonb(s)::text, 'UTF8')), 'hex') AS hash
+                    FROM public.snippets s WHERE sno = ANY(%s)
+                ) fingerprints
+            """, (ids + [51],))
+            cur.execute("SELECT set_config('snippet.wp04_review', %s, true)", cur.fetchone())
+            cur.execute("SAVEPOINT before_edits")
+            cur.execute("UPDATE public.snippets SET code = 'changed' WHERE sno = 43")
+            with self.assertRaises(psycopg2.errors.RaiseException):
+                cur.execute(cleanup)
+            cur.execute("ROLLBACK TO SAVEPOINT before_edits")
+            cur.execute(cleanup)
+            cur.execute("SELECT sno FROM public.snippets ORDER BY sno")
+            self.assertEqual([row[0] for row in cur.fetchall()], [LEGACY[0], 51, 56])
+            cur.execute("SELECT sno FROM snippet_private.wp04_snippet_archive ORDER BY sno")
+            self.assertEqual([row[0] for row in cur.fetchall()], ids)
+            self.assertFalse(self._archive_client_access(cur))
+            pending = str(uuid4())
+            cur.execute("SET LOCAL ROLE supabase_auth_admin")
+            cur.execute("INSERT INTO auth.users (id) VALUES (%s)", (pending,))
+            cur.execute("UPDATE auth.users SET email_confirmed_at = now() WHERE id = %s", (pending,))
+            cur.execute("UPDATE auth.users SET email_confirmed_at = now() WHERE id = %s", (pending,))
+            cur.execute("RESET ROLE")
+            cur.execute("SELECT count(*) FROM public.snippets WHERE owner_id = %s", (pending,))
+            self.assertEqual(cur.fetchone(), (0,))
+            cur.execute("""
+                INSERT INTO public.snippets
+                SELECT (jsonb_populate_record(NULL::public.snippets, original_row)).*
+                FROM snippet_private.wp04_snippet_archive
+            """)
+            self.assertEqual(cur.rowcount, 21)
+            conn.rollback()
+
+    def _archive_client_access(self, cur):
+        cur.execute("""
+            SELECT bool_or(has_table_privilege(role, 'snippet_private.wp04_snippet_archive', 'SELECT'))
+            FROM unnest(ARRAY['anon','authenticated','service_role','snippet_app']) role
+        """)
+        return cur.fetchone()[0]
+
+    def test_cleanup_waits_for_auth_writer_and_can_retry(self):
+        cleanup = RETIRE_STARTERS.strip().removeprefix("BEGIN;").removesuffix("COMMIT;")
+        with closing(psycopg2.connect(self.admin)) as writer, writer.cursor() as writer_cur, \
+             closing(psycopg2.connect(self.admin)) as migrator, migrator.cursor() as migration_cur:
+            writer_cur.execute("INSERT INTO auth.users (id) VALUES (%s)", (str(uuid4()),))
+            with self.assertRaises(psycopg2.errors.LockNotAvailable):
+                migration_cur.execute(cleanup.replace("'3s'", "'100ms'"))
+            migrator.rollback()
+            writer.rollback()
+            migration_cur.execute(cleanup)
+            migrator.rollback()
+
     def test_confirmed_on_signup_and_existing_accounts(self):
         new_user = self.create_account(confirmed=True)
-        self.assertEqual({row[1]: row[2] for row in store.list_snippets(new_user)[0]}, STARTERS)
+        self.assertEqual({row[1]: row[2] for row in self.personal_snippets(new_user)}, STARTERS)
         self.confirm_account(B)
-        self.assertEqual(store.list_snippets(A)[0], [])
-        self.assertEqual(store.list_snippets(B)[0], [])
+        self.assertEqual(self.personal_snippets(A), [])
+        self.assertEqual(self.personal_snippets(B), [])
         self.assertIsNone(store.get_snippet(new_user, LEGACY[0]))
 
     def test_concurrent_confirmation_seeds_once_and_respects_deletion(self):
         new_user = self.create_account()
-        self.assertEqual(store.list_snippets(new_user)[0], [])
+        self.assertEqual(self.personal_snippets(new_user), [])
         barrier = Barrier(2)
 
         def confirm():
@@ -688,7 +823,7 @@ class AppTest(unittest.TestCase):
             for future in futures:
                 future.result(timeout=10)
 
-        rows = store.list_snippets(new_user)[0]
+        rows = self.personal_snippets(new_user)
         self.assertEqual(len(rows), 4)
         self.assertEqual({row[1]: row[2] for row in rows}, STARTERS)
         for _, name, _, code in rows:
@@ -700,14 +835,14 @@ class AppTest(unittest.TestCase):
         token = fake_jwt(new_user, str(uuid4()))
         auth.provider.oauth_tokens[token] = new_user
         api = bearer(token)
-        self.assertEqual(len(self.browser.get("/api/snippets", headers=api).json), 4)
-        self.assertEqual(self.browser.get("/api/snippets", headers=self.api_a).json, [])
+        self.assertEqual(len(self.browser.get("/api/snippets", headers=api).json), 8)
+        self.assertEqual(len(self.browser.get("/api/snippets", headers=self.api_a).json), 4)
         hello = next(row for row in rows if row[1] == "Hello World")
         self.assertEqual(self.browser.delete(f"/api/snippets/{hello[0]}", headers=api).status_code, 200)
         self.confirm_account(new_user)
         self.login("new@sample.test")
-        self.assertNotIn(b"Hello World", self.browser.get("/").data)
-        self.assertEqual(len(self.browser.get("/api/snippets", headers=api).json), 3)
+        self.assertIn(b"Hello World", self.browser.get("/").data)
+        self.assertEqual(len(self.browser.get("/api/snippets", headers=api).json), 7)
 
     def test_failed_provisioning_rolls_back_and_pending_signup_can_be_deleted(self):
         pending = self.create_account()
@@ -718,12 +853,12 @@ class AppTest(unittest.TestCase):
         try:
             with self.assertRaises(psycopg2.errors.CheckViolation):
                 self.confirm_account(user)
-            self.assertEqual(store.list_snippets(user)[0], [])
+            self.assertEqual(self.personal_snippets(user), [])
         finally:
             with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
                 cur.execute("ALTER TABLE public.snippets DROP CONSTRAINT fixture_failure")
         self.confirm_account(user)
-        self.assertEqual(len(store.list_snippets(user)[0]), 4)
+        self.assertEqual(len(self.personal_snippets(user)), 4)
 
     def test_starter_role_cannot_read_or_write_outside_owner_context(self):
         with closing(psycopg2.connect(self.admin)) as conn, conn.cursor() as cur:
@@ -756,7 +891,12 @@ class AppTest(unittest.TestCase):
         starter_rollback = STARTER_UNDO.strip().removeprefix("BEGIN;").removesuffix("COMMIT;")
         ownership_rollback = UNDO.strip().removeprefix("BEGIN;").removesuffix("COMMIT;")
         public_rollback = PUBLIC_UNDO.split("BEGIN;", 1)[1].removesuffix("COMMIT;\n")
-        rollback_body = public_rollback + "SET LOCAL ROLE wp01_migrator;" + starter_rollback + "RESET ROLE;" + ownership_rollback
+        rollback_body = (
+            "DROP TABLE public.default_snippets;"
+            "ALTER TABLE public.snippets DROP CONSTRAINT snippets_personal_id_range;"
+            "ALTER SEQUENCE public.snippets_sno_seq MAXVALUE 2147483647;"
+            + public_rollback + "SET LOCAL ROLE wp01_migrator;" + starter_rollback + "RESET ROLE;" + ownership_rollback
+        )
         store.add_snippet(A, "keep", "rls", "keep")
         with closing(psycopg2.connect(self.admin)) as conn, conn.cursor() as cur:
             with self.assertRaises(psycopg2.errors.RaiseException):

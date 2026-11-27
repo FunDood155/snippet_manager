@@ -4,6 +4,14 @@ from contextlib import closing, contextmanager
 import psycopg2
 
 
+DEFAULT_ID_MIN = 2_000_000_000
+LIBRARY_SQL = """
+    SELECT sno, name, cat, code FROM public.snippets WHERE owner_id = %s
+    UNION ALL
+    SELECT sno, name, cat, code FROM public.default_snippets
+"""
+
+
 @contextmanager
 def cursor(owner=None):
     # This DSN must authenticate as the dedicated NOINHERIT runtime role.
@@ -19,7 +27,7 @@ def cursor(owner=None):
 
 def list_snippets(owner, search=None, category=None, include_categories=False):
     with cursor(owner) as cur:
-        sql = "SELECT sno, name, cat, code FROM public.snippets WHERE owner_id = %s"
+        sql = f"SELECT sno, name, cat, code FROM ({LIBRARY_SQL}) AS library WHERE true"
         params = [owner]
         if search:
             sql += " AND (name ILIKE %s OR code ILIKE %s)"
@@ -31,14 +39,18 @@ def list_snippets(owner, search=None, category=None, include_categories=False):
         rows = cur.fetchall()
         categories = []
         if include_categories:
-            cur.execute("SELECT DISTINCT cat FROM public.snippets WHERE owner_id = %s ORDER BY cat", (owner,))
+            cur.execute(f"SELECT DISTINCT cat FROM ({LIBRARY_SQL}) AS library ORDER BY cat", (owner,))
             categories = cur.fetchall()
         return rows, categories
 
 
 def get_snippet(owner, sno):
     with cursor(owner) as cur:
-        cur.execute("SELECT sno, name, cat, code FROM public.snippets WHERE owner_id = %s AND sno = %s", (owner, sno))
+        if sno >= DEFAULT_ID_MIN:
+            cur.execute("SELECT sno, name, cat, code FROM public.default_snippets WHERE sno = %s", (sno,))
+        else:
+            cur.execute("SELECT sno, name, cat, code FROM public.snippets WHERE owner_id = %s AND sno = %s",
+                        (owner, sno))
         return cur.fetchone()
 
 
@@ -58,6 +70,8 @@ def add_snippet(owner, name, cat, code, reject_duplicate=False):
 
 
 def delete_snippet(owner, sno):
+    if sno >= DEFAULT_ID_MIN:
+        return False
     with cursor(owner) as cur:
         cur.execute("DELETE FROM public.snippets WHERE owner_id = %s AND sno = %s", (owner, sno))
         return cur.rowcount == 1
