@@ -5,7 +5,7 @@ import json
 import re
 import secrets
 import time
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import UUID
 
 import requests
@@ -22,6 +22,8 @@ AUTHORIZATION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 EMAIL_TOKEN_HASH = re.compile(r"[A-Za-z0-9_-]{20,256}")
 EMAIL_LINK_PATHS = {"signup": "/auth/confirm-email", "recovery": "/auth/reset-password"}
 CALLBACK_PATH = "/oauth/vscode/callback"
+VSCODE_LAUNCH_TTL = 60
+VSCODE_LAUNCH_SESSION_KEY = "vscode_launch"
 
 
 class AuthError(Exception):
@@ -519,6 +521,16 @@ def valid_callback(value):
         return False
 
 
+def callback_payload(params):
+    state = params.get("state", [])
+    codes = params.get("code", [])
+    errors = params.get("error", [])
+    if (len(state) != 1 or not re.fullmatch(r"[\w-]{43}", state[0], re.ASCII)
+            or len(codes) + len(errors) != 1 or (codes and not re.fullmatch(r"[\w.-]{1,512}", codes[0], re.ASCII))):
+        return None
+    return {"state": state[0], **({"code": codes[0]} if codes else {"error": "access_denied"})}
+
+
 @bp.route("/oauth/consent", methods=["GET", "POST"])
 def consent():
     authorization_id = pending_authorization()
@@ -527,6 +539,7 @@ def consent():
     if not web_identity():
         return redirect(url_for("auth.login", authorization_id=authorization_id))
     path = "/oauth/authorizations/" + quote(authorization_id, safe="")
+    fresh_approval = False
     try:
         details = provider("GET", path, token=g.web_token)
         if "redirect_url" not in details:
@@ -539,6 +552,7 @@ def consent():
             if action not in ("approve", "deny"):
                 abort(400, "Invalid consent action.")
             details = provider("POST", path + "/consent", token=g.web_token, body={"action": action})
+            fresh_approval = action == "approve"
     except AuthError as exc:
         if exc.status in (400, 401, 403, 404, 422):
             abort(400, "Authorization expired or is invalid. Restart sign-in from VS Code.")
@@ -546,16 +560,33 @@ def consent():
     target = details.get("redirect_url")
     if not valid_callback(target):
         abort(400, "Unrecognized authorization callback.")
+    if fresh_approval:
+        payload = callback_payload(parse_qs(urlsplit(target).query, keep_blank_values=True))
+        if payload and "code" in payload:
+            session[VSCODE_LAUNCH_SESSION_KEY] = {
+                "digest": digest("vscode-launch:" + urlencode(payload)),
+                "expires": int(time.time()) + VSCODE_LAUNCH_TTL,
+            }
     return redirect(target, code=303)
 
 
 @bp.get(CALLBACK_PATH)
 def vscode_callback():
-    state = request.args.getlist("state")
-    codes = request.args.getlist("code")
-    errors = request.args.getlist("error")
-    if (len(state) != 1 or not re.fullmatch(r"[\w-]{43}", state[0], re.ASCII)
-            or len(codes) + len(errors) != 1 or (codes and not re.fullmatch(r"[\w.-]{1,512}", codes[0], re.ASCII))):
+    if not request.args:
+        return render_template("vscode_callback.html", callback_ended=True)
+
+    payload = callback_payload(request.args.to_dict(flat=False))
+    if not payload:
         abort(400, "Invalid authorization callback. Restart sign-in from VS Code.")
-    payload = {"state": state[0], **({"code": codes[0]} if codes else {"error": "access_denied"})}
-    return render_template("vscode_callback.html", query=urlencode(payload), authorized=bool(codes))
+    query = urlencode(payload)
+    authorized = "code" in payload
+    launch = None
+    eligibility = session.get(VSCODE_LAUNCH_SESSION_KEY)
+    if eligibility:
+        expires = eligibility["expires"]
+        if expires <= time.time():
+            session.pop(VSCODE_LAUNCH_SESSION_KEY)
+        elif authorized and hmac.compare_digest(eligibility["digest"], digest("vscode-launch:" + query)):
+            session.pop(VSCODE_LAUNCH_SESSION_KEY)
+            launch = {"marker": digest("vscode-attempt:" + payload["state"]), "expires": expires}
+    return render_template("vscode_callback.html", query=query, authorized=authorized, launch=launch)

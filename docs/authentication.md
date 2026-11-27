@@ -190,3 +190,18 @@ clean desktop VS Code profile that satisfies the manifest's engine version.
   configuration, private runtime DSN, backup restoration, and absence of
   unplanned Vercel deployment. `feature/authentication` includes a
   branch-specific Vercel Git deployment opt-out.
+
+### Automatic VS Code launch
+
+Completing a fresh consent approval allows one automatic Stable VS Code launch
+within 60 seconds. Flask ties that eligibility to the specific validated
+callback and consumes it when the browser opens the callback. The page removes
+the authorization query from browser history and uses a short-lived, opaque
+marker with an origin-scoped browser lock to prevent duplicate launches in the
+same browser profile.
+
+Use **Open VS Code** or **Open VS Code Insiders** if the browser blocks the launch
+or storage, or if Supabase completes authorization directly using an existing
+grant. Decline uses the manual return link to deliver cancellation. If a
+restored or reloaded page says the callback closed, restart sign-in from VS Code
+if needed. Browser and operating-system protocol prompts still apply.
