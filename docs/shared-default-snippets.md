@@ -71,3 +71,22 @@ For rollback, redeploy the prior backend while retaining both preference
 tables and their rows. It can read the preexisting schema, and the web
 favorites and editing controls return when WP-07 is deployed again. Keep
 existing snippets and preferences in place.
+
+## Manage shared templates
+
+In Supabase Table Editor, authorized database administrators can edit the
+`public.default_snippets` row for a shared snippet. Keep its ID and runnable
+`code` stable for older clients. Set `language` explicitly and put editable
+source in `template_code`. Clear `template_code` to return to literal insertion.
+The app role only reads shared snippets. Users can duplicate one to edit their
+own copy.
+
+VS Code 1.1.0 uses `{{name}}` for native tab stops. Matching names share a stop.
+Use 1–20 placeholder occurrences with names 1–24 characters long, starting
+with an ASCII letter or underscore and continuing with letters, digits, or
+underscores. Keep double braces paired. Nested braces, transforms and
+expressions are unsupported. Before saving, validate the source with
+`snippet_metadata.valid_template` and check that replacing each placeholder
+with its name produces valid code in the selected language. Web copy preserves
+the full template text. Legacy API reads still return the original runnable
+source.

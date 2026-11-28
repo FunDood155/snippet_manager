@@ -1,3 +1,4 @@
+import ast
 import base64
 import json
 import os
@@ -19,6 +20,7 @@ from psycopg2 import sql
 import auth
 import main
 import store
+from snippet_metadata import valid_template
 
 
 A = "11111111-1111-4111-8111-111111111111"
@@ -41,6 +43,7 @@ PUBLIC_AUTH = next((ROOT / "supabase/migrations").glob("*_public_authentication.
 SHARED_DEFAULTS = next((ROOT / "supabase/migrations").glob("*_shared_default_snippets.sql")).read_text()
 FAVORITES_EDIT = next((ROOT / "supabase/migrations").glob("*_snippet_favorites_and_editing.sql")).read_text()
 PRODUCTIVITY = next((ROOT / "supabase/migrations").glob("*_developer_productivity.sql")).read_text()
+DEFAULT_TEMPLATES = next((ROOT / "supabase/migrations").glob("*_default_snippet_templates.sql")).read_text()
 HIDDEN_DEFAULTS = next((ROOT / "supabase/migrations").glob("*_hidden_default_snippets.sql")).read_text()
 RETIRE_STARTERS = next((ROOT / "supabase/migrations").glob("*_retire_starter_copies.sql")).read_text()
 PUBLIC_UNDO = (ROOT / "supabase/rollback_public_authentication.sql").read_text()
@@ -213,6 +216,7 @@ class AppTest(unittest.TestCase):
                 cur.execute(HIDDEN_DEFAULTS)
                 cur.execute(FAVORITES_EDIT)
                 cur.execute(PRODUCTIVITY)
+                cur.execute(DEFAULT_TEMPLATES)
                 cur.execute("DELETE FROM snippet_private.legacy_email_holds WHERE user_id IN (%s, %s)", (A, B))
                 cur.execute("ALTER ROLE snippet_app LOGIN PASSWORD 'fixture-only'")
 
@@ -1064,6 +1068,100 @@ class AppTest(unittest.TestCase):
         }).status_code, 404)
         self.assertEqual(self.browser.post("/api/logout", headers=self.api_b).status_code, 204)
         self.assertEqual(self.browser.get(url, headers=self.api_b).status_code, 401)
+
+    def test_shared_templates_preserve_both_representations_and_preferences(self):
+        originals = self.browser.get("/api/snippets", headers=self.api_a).json
+        extended = self.browser.get("/api/snippets?v=2&language=python", headers=self.api_a).json
+        self.assertEqual([r["sno"] for r in extended], [r["sno"] for r in originals])
+        self.assertEqual(len(extended), 4)
+        for original, row in zip(originals, extended):
+            sno = row["sno"]
+            with self.subTest(sno=sno):
+                ast.parse(original["code"])
+                self.assertEqual(self.browser.get(f"/api/snippets/{sno}", headers=self.api_a).json, original)
+                self.assertEqual(self.browser.get(f"/api/snippets/{sno}?v=2", headers=self.api_a).json["code"], row["code"])
+                self.assertEqual((row["name"], row["cat"]), (original["name"], original["cat"]))
+                self.assertTrue(row["template"])
+                self.assertNotEqual(row["code"], original["code"])
+                self.assertTrue(valid_template(row["code"]))
+                ast.parse(re.sub(r"\{\{(\w+)\}\}", r"\1", row["code"]))
+
+        hello = extended[0]
+        sno = hello["sno"]
+        self.assertEqual(self.browser.get("/api/snippets?search=message", headers=self.api_a).json, [])
+        self.assertEqual(self.browser.get("/api/snippets?v=2&search=message&category=Basics", headers=self.api_a).json, [hello])
+        self.assertTrue(store.set_favorite(A, sno, True))
+        self.assertTrue(store.record_recent(A, sno))
+        self.login()
+        page = self.browser.get("/?scope=favorites&language=python&search=message").text
+        self.assertIn("Recently used", page)
+        self.assertIn("1 snippet", page)
+        self.assertIn("Python", page)
+        self.assertIn("Template", page)
+        copy = re.search(r'data-copy="([^"]+)"', page)
+        self.assertEqual(json.loads(unescape(copy[1])), hello["code"])
+        duplicate = self.browser.get(f"/duplicate/{sno}").text
+        self.assertIn('name="template" checked', duplicate)
+        token = csrf(self.browser, "/")
+        form = {"csrf_token": token, "name": "My shared template copy", "cat": "Basics",
+                "language": "python", "template": "on", "code": hello["code"]}
+        self.assertEqual(self.browser.post(f"/duplicate/{sno}", data=form).status_code, 303)
+        copy_row = self.browser.get("/api/snippets?v=2&search=My shared template copy", headers=self.api_a).json[0]
+        self.assertNotEqual(copy_row["sno"], sno)
+        self.assertTrue(copy_row["template"])
+        self.assertEqual(copy_row["code"], hello["code"])
+        self.assertEqual(self.browser.get(f"/api/snippets/{copy_row['sno']}?v=2", headers=self.api_b).status_code, 404)
+        self.assertEqual(self.browser.post(f"/edit/{copy_row['sno']}", data={**form, "code": 'print("{{greeting}}")'}).status_code, 303)
+        self.assertEqual(self.browser.get(f"/api/snippets/{sno}?v=2", headers=self.api_a).json["code"], hello["code"])
+        self.assertTrue(store.hide_default(A, sno))
+        self.assertEqual(self.browser.get(f"/api/snippets/{sno}?v=2", headers=self.api_a).status_code, 404)
+        self.assertEqual(self.browser.get(f"/api/snippets/{sno}?v=2", headers=self.api_b).status_code, 200)
+        self.assertTrue(store.restore_default(A, sno))
+        self.assertIn("Recently used", self.browser.get("/?scope=favorites").text)
+
+    def test_shared_template_migration_rejects_drift_and_preserves_literal_fallback(self):
+        migration = DEFAULT_TEMPLATES.strip().removeprefix("BEGIN;").removesuffix("COMMIT;")
+        with closing(psycopg2.connect(self.admin)) as conn, conn.cursor() as cur:
+            cur.execute("SELECT sno, name, cat, code FROM public.default_snippets ORDER BY sno")
+            originals = cur.fetchall()
+            cur.execute("ALTER TABLE public.default_snippets DROP COLUMN template_code")
+            cur.execute("UPDATE public.default_snippets SET language = NULL")
+            cur.execute("UPDATE public.default_snippets SET code = 'admin edit' WHERE sno = 2000000000")
+            cur.execute("SAVEPOINT drift")
+            with self.assertRaisesRegex(psycopg2.errors.RaiseException, "differ from the reviewed originals"):
+                cur.execute(migration)
+            cur.execute("ROLLBACK TO drift")
+            cur.execute("SELECT code FROM public.default_snippets WHERE sno = 2000000000")
+            self.assertEqual(cur.fetchone(), ("admin edit",))
+            cur.execute("UPDATE public.default_snippets SET code = %s WHERE sno = 2000000000", (originals[0][3],))
+            cur.execute("INSERT INTO snippet_private.hidden_default_snippets VALUES (%s, 2000000000)", (B,))
+            cur.execute("INSERT INTO snippet_private.favorite_default_snippets VALUES (%s, 2000000000)", (A,))
+            cur.execute("INSERT INTO snippet_private.recent_default_snippets VALUES (%s, 2000000000, now())", (A,))
+            cur.execute(migration)
+            cur.execute("SELECT sno, name, cat, code FROM public.default_snippets ORDER BY sno")
+            self.assertEqual(cur.fetchall(), originals)
+            cur.execute("""SELECT (SELECT snippet_id FROM snippet_private.hidden_default_snippets WHERE user_id = %s),
+                                  (SELECT snippet_id FROM snippet_private.favorite_default_snippets WHERE user_id = %s),
+                                  (SELECT snippet_id FROM snippet_private.recent_default_snippets WHERE user_id = %s)""", (B, A, A))
+            self.assertEqual(cur.fetchone(), (2000000000,) * 3)
+            conn.rollback()
+
+        with store.cursor(A) as cur:
+            cur.execute("""SELECT has_column_privilege('public.default_snippets','template_code','SELECT'),
+                                  has_column_privilege('public.default_snippets','template_code','UPDATE')""")
+            self.assertEqual(cur.fetchone(), (True, False))
+            with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+                cur.execute("UPDATE public.default_snippets SET template_code = NULL")
+
+        with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+            cur.execute("INSERT INTO public.default_snippets (name, cat, code) VALUES ('Literal control', 'Extras', 'pass') RETURNING sno")
+            literal = cur.fetchone()[0]
+        try:
+            row = self.browser.get(f"/api/snippets/{literal}?v=2", headers=self.api_a).json
+            self.assertEqual((row["code"], row["template"]), ("pass", False))
+        finally:
+            with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM public.default_snippets WHERE sno = %s", (literal,))
 
     def test_dashboard_combines_filters_and_preserves_invalid_drafts(self):
         self.login()

@@ -23,12 +23,16 @@ RECENT_PERSONAL = "snippet_private.recent_personal_snippets"
 RECENT_DEFAULT = "snippet_private.recent_default_snippets"
 RECENTS_SQL = f"SELECT snippet_id, used_at FROM {RECENT_PERSONAL} UNION ALL SELECT snippet_id, used_at FROM {RECENT_DEFAULT}"
 PERSONAL_SQL = "SELECT sno, name, cat, code, language, template FROM public.snippets WHERE owner_id = %s"
-VISIBLE_DEFAULTS_SQL = """
-    SELECT d.sno, d.name, d.cat, d.code, d.language, false AS template FROM public.default_snippets d
-    WHERE NOT EXISTS (
-        SELECT 1 FROM snippet_private.hidden_default_snippets h WHERE h.user_id = %s AND h.snippet_id = d.sno
-    )
-"""
+def visible_defaults_sql(extended=False):
+    code = "coalesce(d.template_code, d.code)" if extended else "d.code"
+    template = "d.template_code IS NOT NULL" if extended else "false"
+    return f"""
+        SELECT d.sno, d.name, d.cat, {code} AS code, d.language, {template} AS template
+        FROM public.default_snippets d
+        WHERE NOT EXISTS (
+            SELECT 1 FROM snippet_private.hidden_default_snippets h WHERE h.user_id = %s AND h.snippet_id = d.sno
+        )
+    """
 
 
 def connect():
@@ -98,11 +102,12 @@ def library_page(owner, page, page_size, revision=None, **selection):
 
 def select_snippets(cur, owner, search=None, category=None, include_categories=False, scope="all", sort="default",
                     include_favorites=False, page=None, page_size=None, extended=False, language=None):
-    personal_and_defaults = PERSONAL_SQL + " UNION ALL " + VISIBLE_DEFAULTS_SQL
+    defaults = visible_defaults_sql(extended)
+    personal_and_defaults = PERSONAL_SQL + " UNION ALL " + defaults
     library, owners = {
         "all": (personal_and_defaults, (owner, owner)),
         "personal": (PERSONAL_SQL, (owner,)),
-        "defaults": (VISIBLE_DEFAULTS_SQL, (owner,)),
+        "defaults": (defaults, (owner,)),
         "favorites": (personal_and_defaults, (owner, owner)),
     }[scope]
     favorite_only = scope == "favorites"
@@ -167,7 +172,7 @@ def select_snippets(cur, owner, search=None, category=None, include_categories=F
     return rows, categories
 
 def get_snippet(owner, sno, extended=False):
-    sql = VISIBLE_DEFAULTS_SQL if sno >= DEFAULT_ID_MIN else PERSONAL_SQL
+    sql = visible_defaults_sql(extended) if sno >= DEFAULT_ID_MIN else PERSONAL_SQL
     with cursor(owner) as cur:
         columns = "sno, name, cat, code, language, template" if extended else "sno, name, cat, code"
         cur.execute(f"SELECT {columns} FROM ({sql}) AS library WHERE sno = %s", (owner, sno))
@@ -217,7 +222,7 @@ def restore_all_defaults(owner):
 
 def set_favorite(owner, sno, favorite):
     shared = sno >= DEFAULT_ID_MIN
-    library = VISIBLE_DEFAULTS_SQL if shared else PERSONAL_SQL
+    library = visible_defaults_sql() if shared else PERSONAL_SQL
     table = DEFAULT_FAVORITES if shared else PERSONAL_FAVORITES
     change = (
         f"INSERT INTO {table} (user_id, snippet_id) SELECT %s, sno FROM target ON CONFLICT DO NOTHING"
@@ -273,7 +278,7 @@ def delete_snippet(owner, sno):
 
 def record_recent(owner, sno):
     shared = sno >= DEFAULT_ID_MIN
-    target = VISIBLE_DEFAULTS_SQL if shared else PERSONAL_SQL
+    target = visible_defaults_sql() if shared else PERSONAL_SQL
     table = RECENT_DEFAULT if shared else RECENT_PERSONAL
     with cursor(owner) as cur:
         cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"snippet-recent:{owner}",))
