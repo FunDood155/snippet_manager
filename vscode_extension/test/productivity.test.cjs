@@ -185,6 +185,15 @@ test('save command is contextual and keyboard shortcuts stay user-configurable',
     const save = contributes.commands.find(item => item.command.endsWith('.saveSelectedCode'));
     const menu = contributes.menus['editor/context'].find(item => item.command === save.command);
     assert.equal(menu.when, 'editorHasSelection && !editorHasMultipleSelections');
-    assert.equal(save.enablement, menu.when);
-    assert.equal(contributes.keybindings, undefined);
+    assert.equal(save.enablement, undefined, 'The palette command can explain an invalid selection.');
+    const keyboard = contributes.keybindings;
+    assert.deepEqual(keyboard.map(({command, key, mac}) => [command, key, mac]), [
+        ['code-snippet-manager.showSnippets', 'ctrl+k ctrl+shift+1', 'cmd+k ctrl+shift+1'],
+        ['code-snippet-manager.searchSnippets', 'ctrl+k ctrl+shift+2', 'cmd+k ctrl+shift+2'],
+        ['code-snippet-manager.insertSnippet', 'ctrl+k ctrl+shift+3', 'cmd+k ctrl+shift+3'],
+        ['code-snippet-manager.saveSelectedCode', 'ctrl+k ctrl+shift+4', 'cmd+k ctrl+shift+4'],
+    ]);
+    assert.deepEqual(keyboard.map(item => item.when), [
+        'editorTextFocus', 'editorTextFocus', 'editorTextFocus && !editorReadonly', 'editorTextFocus && ' + menu.when,
+    ]);
 });

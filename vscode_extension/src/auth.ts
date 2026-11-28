@@ -25,6 +25,8 @@ export const credentialKey = 'snippet-manager.session';
 
 export class SignInRequired extends Error {}
 export class AuthUnavailable extends Error {}
+export class SaveSessionChanged extends Error {}
+export class SaveUnconfirmed extends Error {}
 
 export function trustedOrigin(input: string): string {
     const url = new URL(input);
@@ -82,6 +84,7 @@ export class SignInRequest {
 export class AuthClient {
     private queue: Promise<unknown> = Promise.resolve();
     private pendingLibrary?: PendingLibrary;
+    private saveDrafts = new Set<{ session: SavedSession }>();
 
     constructor(private storage: SecretStorage, private server: () => string, private http = fetch) {}
 
@@ -210,26 +213,45 @@ export class AuthClient {
         }
     }
 
-    async prepareSnippetSave() {
-        const saved = await this.load();
-        if (!saved) throw new SignInRequired();
-        return (fields: {name: string; cat: string; code: string; language: string}) => this.serialize(async () => {
-            if (!this.sameSession(saved, await this.load())) {
-                throw new AuthUnavailable('The Snippo session changed.');
+    async prepareSnippetSave(isCurrent: () => boolean) {
+        const draft = await this.serialize(async () => {
+            const session = await this.load();
+            if (!isCurrent()) throw new SaveSessionChanged();
+            if (!session) throw new SignInRequired();
+            const draft = { session };
+            this.saveDrafts.add(draft);
+            return draft;
+        });
+        let submitted = false;
+        const dispose = () => { this.saveDrafts.delete(draft); };
+        const save = (fields: {name: string; cat: string; code: string; language: string}) => this.serialize(async () => {
+            if (submitted || !this.saveDrafts.has(draft)) throw new SaveSessionChanged();
+            submitted = true;
+            const current = await this.load();
+            if (!current || !isCurrent() || !this.sameSession(draft.session, current)) {
+                throw new SaveSessionChanged();
             }
-            const session = saved.tokens.expires <= Date.now() + 30_000 ? await this.refresh(saved) : saved;
-            if (!this.sameSession(session, await this.load())) {
-                throw new AuthUnavailable('The Snippo session changed.');
+            const session = current.tokens.expires <= Date.now() + 30_000 ? await this.refresh(current) : current;
+            if (!this.sameSession(session, await this.load()) || !isCurrent()) throw new SaveSessionChanged();
+
+            // This request can commit even when the response is lost. Never replay it.
+            let response: Response;
+            try {
+                response = await this.send(session.origin + '/api/snippets?v=2', {
+                    method: 'POST',
+                    headers: {Authorization: `Bearer ${session.tokens.access}`, 'Content-Type': 'application/json'},
+                    body: JSON.stringify(fields),
+                });
+            } catch {
+                throw new SaveUnconfirmed();
             }
-            // A failed or uncertain POST must never be replayed automatically.
-            const response = await this.send(session.origin + '/api/snippets?v=2', {
-                method: 'POST',
-                headers: {Authorization: `Bearer ${session.tokens.access}`, 'Content-Type': 'application/json'},
-                body: JSON.stringify(fields),
-            });
-            if (response.status === 401) throw new SignInRequired();
+            if (response.status === 401) {
+                if (this.sameSession(session, await this.load())) await this.storage.delete(credentialKey);
+                throw new SignInRequired();
+            }
             return response;
         });
+        return { save, dispose };
     }
 
     cancelLibraryReads() {
@@ -320,6 +342,10 @@ export class AuthClient {
                 throw new AuthUnavailable('The Snippo session changed.');
             }
             await this.save(renewed);
+            // Follow only rotations performed by this client for the exact draft credentials.
+            for (const draft of this.saveDrafts) {
+                if (this.sameSession(draft.session, saved)) draft.session = renewed;
+            }
             return renewed;
         } catch (error) {
             if (error instanceof SignInRequired && this.sameSession(saved, await this.load(true))) {

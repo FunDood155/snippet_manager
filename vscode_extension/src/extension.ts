@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { AuthClient, credentialKey, SignInRequest, SignInRequired } from './auth';
+import { AuthClient, credentialKey, SaveSessionChanged, SaveUnconfirmed, SignInRequest, SignInRequired } from './auth';
 import { buildTemplate } from './snippetTemplates';
 
 const namespace = 'code-snippet-manager';
@@ -253,6 +253,7 @@ export function activate(context: vscode.ExtensionContext) {
             void vscode.window.showInformationMessage('Select one nonempty block of code to save to Snippo.');
             return;
         }
+        const languageId = editor.document.languageId;
         const code = editor.document.getText(editor.selection);
         if (!code.trim()) {
             void vscode.window.showInformationMessage('The selected code is blank.');
@@ -265,26 +266,35 @@ export function activate(context: vscode.ExtensionContext) {
 
         saving = true;
         const initialGeneration = generation;
+        const isCurrent = () => generation === initialGeneration;
+        const checkCurrent = () => {
+            if (!isCurrent()) throw new SaveSessionChanged();
+        };
+        let dispose: (() => void) | undefined;
         try {
-            const save = await auth.prepareSnippetSave();
+            const draft = await auth.prepareSnippetSave(isCurrent);
+            dispose = draft.dispose;
             const required = (value: string) => value.trim() ? undefined : 'Enter a value.';
             const name = await vscode.window.showInputBox({prompt: 'Snippet name', validateInput: required});
-            if (name === undefined || generation !== initialGeneration) return;
+            if (name === undefined) return;
+            checkCurrent();
             const cat = await vscode.window.showInputBox({prompt: 'Category', validateInput: required});
-            if (cat === undefined || generation !== initialGeneration) return;
-            const languageId = editor.document.languageId;
+            if (cat === undefined) return;
+            checkCurrent();
             const suggested = VS_CODE_LANGUAGE_ALIASES[languageId] ?? languageId;
             const options = [{label: 'Unspecified', id: ''}, ...Object.entries(languages)
                 .map(([id, label]) => ({label: id === suggested ? label + ' (editor language)' : label, id}))];
             options.sort((a, b) => Number(b.id === suggested) - Number(a.id === suggested));
             const language = await vscode.window.showQuickPick(options, {placeHolder: 'Choose a language'});
-            if (!language || generation !== initialGeneration) return;
+            if (!language) return;
+            checkCurrent();
             const confirmed = await vscode.window.showWarningMessage('Save selected code to your Snippo account?', {
                 modal: true, detail: 'Only the selected text will be sent to your configured Snippo server.',
             }, 'Save');
-            if (confirmed !== 'Save' || generation !== initialGeneration) return;
+            if (confirmed !== 'Save') return;
+            checkCurrent();
 
-            const response = await save({name, cat, code, language: language.id});
+            const response = await draft.save({name, cat, code, language: language.id});
             if (response.status === 201) {
                 const body = await response.json().catch(() => ({})) as {language?: unknown};
                 if (language.id && !body.language) {
@@ -303,8 +313,14 @@ export function activate(context: vscode.ExtensionContext) {
             }
         } catch (error) {
             if (error instanceof SignInRequired) throw error;
-            void vscode.window.showWarningMessage('Snippo could not confirm the save. Check your library before trying again.');
+            const message = error instanceof SaveSessionChanged
+                ? 'Your Snippo session or server changed. No code was sent. Run Save Selected Code again.'
+                : error instanceof SaveUnconfirmed
+                    ? 'Snippo could not confirm the save. Check your library before trying again.'
+                    : 'Could not check your Snippo session. No code was sent. Check your connection and try again.';
+            void vscode.window.showWarningMessage(message);
         } finally {
+            dispose?.();
             saving = false;
         }
     });

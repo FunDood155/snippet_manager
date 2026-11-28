@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1
+
+- Preserve a selected-code save while the same Snippo session renews. Stop when the server or account changes and distinguish that case from an unconfirmed save.
+- Add configurable editor chords for Show, Search, Insert, and Save Selected Code. The palette reports invalid selections.
+
 ## 1.1.0
 
 - Save explicitly selected code from the editor with a name, category and optional language.

@@ -58,6 +58,27 @@ The picker shows up to five recent matching snippets for your account. A success
 
 Select **Use named placeholders in VS Code** when adding or editing a personal snippet on the website. A field such as {{name}} becomes a native tab stop. Repeated names share one stop. Use 1–20 occurrences, with names 1–24 characters long, starting with an ASCII letter or underscore and continuing with letters, digits or underscores. Template mode starts off. Leave it off for literal brace syntax. Web copy preserves the literal source. VS Code 1.0.0 and 1.0.1 insert template source literally.
 
-### Assign keyboard shortcuts
+### Keyboard shortcuts
 
-Open **Preferences: Open Keyboard Shortcuts**, search for **Snippo: Insert Snippet**, **Snippo: Show Snippets** or **Snippo: Save Selected Code**, then select the pencil and choose an unused binding. Use **Show Same Keybindings** to check for conflicts. In `keybindings.json`, use `editorTextFocus` for Insert and `editorTextFocus && editorHasSelection && !editorHasMultipleSelections` for Save Selected Code. Snippo leaves default system and editor shortcuts available.
+Press the first chord, release it, then press the second chord. Focus the editor before using a shortcut.
+
+| Snippo command | Windows and Linux | macOS | When |
+|---|---|---|---|
+| Show Snippets | Ctrl+K, Ctrl+Shift+1 | Cmd+K, Ctrl+Shift+1 | Editor text is focused |
+| Search Snippets | Ctrl+K, Ctrl+Shift+2 | Cmd+K, Ctrl+Shift+2 | Editor text is focused |
+| Insert Snippet | Ctrl+K, Ctrl+Shift+3 | Cmd+K, Ctrl+Shift+3 | Editor text is focused and writable |
+| Save Selected Code | Ctrl+K, Ctrl+Shift+4 | Cmd+K, Ctrl+Shift+4 | Editor text is focused with one nonempty selection |
+
+To reassign a shortcut, open **Preferences: Open Keyboard Shortcuts**, search
+for the Snippo command, then double-click its binding. Press your preferred
+key or chord and hit Enter. Use **Show Same Keybindings** to check for conflicts.
+User bindings take priority over extension defaults. In `keybindings.json`, use
+`editorTextFocus` for the pickers, add `!editorReadonly` for Insert and use
+`editorTextFocus && editorHasSelection && !editorHasMultipleSelections`
+for Save Selected Code.
+
+If a shortcut still opens another command, run **Developer: Toggle Keyboard
+Shortcuts Troubleshooting** and press it again to see what VS Code resolves.
+The Command Palette can also run **Snippo: Save Selected Code** and explain
+an invalid selection. Right-clicking a single selection offers the same save
+command. Both paths ask for confirmation before uploading it.
