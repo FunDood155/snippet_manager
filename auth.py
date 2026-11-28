@@ -8,7 +8,7 @@ import time
 from http.cookiejar import DefaultCookiePolicy
 from threading import local
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg2
 import requests
@@ -91,22 +91,110 @@ def digest(value):
 
 def limit(action, subject, max_hits, total_hits):
     window = int(time.time()) // 300
-    buckets = [(digest(f"{action}:all"), total_hits), (digest(f"{action}:input:{subject}"), max_hits)]
+    global_bucket = digest(f"{action}:all") if total_hits else None
+    subject_bucket = digest(f"{action}:input:{subject}")
+    # A failed subject check never spends the shared budget. Roll back the
+    # subject increment if another request takes the last shared slot first.
     with store.cursor() as cur:
-        cur.execute("DELETE FROM snippet_private.auth_limits WHERE window_id < %s", (window - 1,))
-        allowed = True
-        for bucket, maximum in buckets:
-            cur.execute(
-                """INSERT INTO snippet_private.auth_limits AS limits VALUES (%s, %s, 1)
+        cur.execute(
+            """WITH subject AS (
+                   INSERT INTO snippet_private.auth_limits AS counters (bucket, window_id, hits)
+                   SELECT %(subject)s, %(window)s, 1 WHERE NOT EXISTS (
+                       SELECT 1 FROM snippet_private.auth_limits
+                       WHERE bucket = %(global)s AND window_id = %(window)s AND hits >= %(total)s
+                   )
                    ON CONFLICT (bucket) DO UPDATE SET window_id = excluded.window_id,
-                     hits = CASE WHEN limits.window_id = excluded.window_id
-                            THEN least(limits.hits + 1, %s) ELSE 1 END
-                   RETURNING hits""",
-                (bucket, window, maximum + 1),
-            )
-            allowed = cur.fetchone()[0] <= maximum and allowed
-    if not allowed:
-        abort(429, "Too many attempts. Wait a few minutes and try again.")
+                       hits = CASE WHEN counters.window_id = excluded.window_id THEN counters.hits + 1 ELSE 1 END
+                   WHERE counters.window_id < excluded.window_id
+                      OR (counters.window_id = excluded.window_id AND counters.hits < %(maximum)s)
+                   RETURNING hits
+               ), shared AS (
+                   INSERT INTO snippet_private.auth_limits AS counters (bucket, window_id, hits)
+                   SELECT %(global)s::text, %(window)s, 1 FROM subject WHERE %(global)s::text IS NOT NULL
+                   ON CONFLICT (bucket) DO UPDATE SET window_id = excluded.window_id,
+                       hits = CASE WHEN counters.window_id = excluded.window_id THEN counters.hits + 1 ELSE 1 END
+                   WHERE counters.window_id < excluded.window_id
+                      OR (counters.window_id = excluded.window_id AND counters.hits < %(total)s)
+                   RETURNING hits
+               ), swept AS (
+                   DELETE FROM snippet_private.auth_limits WHERE bucket IN (
+                       SELECT bucket FROM snippet_private.auth_limits
+                       WHERE window_id < %(window)s - 1
+                         AND bucket <> %(subject)s AND bucket IS DISTINCT FROM %(global)s::text
+                       ORDER BY window_id, bucket LIMIT 64 FOR UPDATE SKIP LOCKED
+                   )
+               )
+               SELECT EXISTS (SELECT 1 FROM subject)
+                   AND (%(global)s::text IS NULL OR EXISTS (SELECT 1 FROM shared))""",
+            {"subject": subject_bucket, "global": global_bucket, "window": window,
+             "maximum": max_hits, "total": total_hits},
+        )
+        if not cur.fetchone()[0]:
+            abort(429, "Too many attempts. Wait a few minutes and try again.")
+
+
+def prune_credentials(cur, table):
+    # Callers use these two fixed table names. Each has an expiry index.
+    cur.execute(f"""DELETE FROM snippet_private.{table} WHERE handle_hash IN (
+                       SELECT handle_hash FROM snippet_private.{table}
+                       WHERE expires_at <= statement_timestamp()
+                       ORDER BY expires_at LIMIT 64 FOR UPDATE SKIP LOCKED)""")
+
+
+def account_lock(cur, owner):
+    cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"auth-transition:{owner}",))
+
+
+def stage_transition(owner, kind, *, flow=None):
+    ticket = str(uuid4())
+    # Commit the denial before an upstream mutation can start. A replacement
+    # attempt invalidates the first ticket, including during its handoff gap.
+    with store.cursor() as cur:
+        account_lock(cur, owner)
+        if flow and not read_email_flow(cur, flow):
+            raise AuthError(401)
+        cur.execute("SELECT pending FROM snippet_private.auth_transitions WHERE user_id = %s", (owner,))
+        row = cur.fetchone()
+        pending = row[0] if row else None
+        if pending == "recovery" and kind == "oauth":
+            raise AuthError(503)
+        cur.execute("""INSERT INTO snippet_private.auth_transitions (user_id, pending, operation_id)
+                       VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE
+                       SET pending = excluded.pending, operation_id = excluded.operation_id""",
+                    (owner, kind, ticket))
+    return ticket, pending
+
+
+def lock_transition(cur, owner, ticket):
+    account_lock(cur, owner)
+    cur.execute("SELECT 1 FROM snippet_private.auth_transitions WHERE user_id = %s AND operation_id = %s",
+                (owner, ticket))
+    if not cur.fetchone():
+        raise AuthError(503)
+
+
+def finish_transition(cur, owner, *, revoked):
+    client_id = current_app.config["SNIPPET_VSCODE_CLIENT_ID"] if revoked else None
+    cur.execute("""UPDATE snippet_private.auth_transitions SET pending = NULL, operation_id = NULL,
+                       oauth_invalid_through = CASE WHEN %s::uuid IS NOT NULL THEN greatest(
+                           oauth_invalid_through, snippet_private.oauth_revocation_boundary(user_id, %s))
+                       ELSE oauth_invalid_through END WHERE user_id = %s""", (client_id, client_id, owner))
+
+
+def restore_transition(cur, owner, previous):
+    if previous is None:
+        finish_transition(cur, owner, revoked=False)
+    elif previous == "oauth":
+        cur.execute("UPDATE snippet_private.auth_transitions SET pending = 'oauth' WHERE user_id = %s", (owner,))
+
+
+def revoke_provider_grant(token):
+    path = "/user/oauth/grants?" + urlencode({"client_id": vscode_client()})
+    try:
+        provider("DELETE", path, token=token)
+    except AuthError as exc:
+        if exc.status != 404:
+            raise
 
 
 def confirmed_identity(user):
@@ -123,13 +211,22 @@ def token_claims(token):
     return json.loads(base64.urlsafe_b64decode(middle + "=" * (-len(middle) % 4)))
 
 
-def check_account_access(cur, owner, verified_token):
+def account_state(cur, owner):
     cur.execute(
-        """SELECT EXISTS (SELECT 1 FROM snippet_private.legacy_email_holds WHERE user_id = %s),
-                  (SELECT invalid_through FROM snippet_private.session_cutoffs WHERE user_id = %s)""",
-        (owner, owner),
+        """SELECT EXISTS (SELECT 1 FROM snippet_private.legacy_email_holds WHERE user_id = %(owner)s),
+                  (SELECT invalid_through FROM snippet_private.session_cutoffs WHERE user_id = %(owner)s),
+                  EXISTS (SELECT 1 FROM snippet_private.auth_transitions
+                          WHERE user_id = %(owner)s AND pending = 'recovery')""",
+        {"owner": owner},
     )
-    check_access_state(*cur.fetchone(), verified_token)
+    return cur.fetchone()
+
+
+def check_account_access(cur, owner, verified_token):
+    held, cutoff, recovering = account_state(cur, owner)
+    if recovering:
+        raise AuthError(503)
+    check_access_state(held, cutoff, verified_token)
 
 
 def check_access_state(held, invalid_through, verified_token):
@@ -151,7 +248,7 @@ def create_session(tokens):
         check_account_access(cur, owner, tokens["access_token"])
         if session.get("handle"):
             cur.execute("DELETE FROM snippet_private.web_sessions WHERE handle_hash = %s", (digest(session["handle"]),))
-        cur.execute("DELETE FROM snippet_private.web_sessions WHERE expires_at <= now()")
+        prune_credentials(cur, "web_sessions")
         cur.execute(
             """INSERT INTO snippet_private.web_sessions
                VALUES (%s, %s, %s, %s, %s, now() + interval '7 days')""",
@@ -166,7 +263,9 @@ def create_session(tokens):
 def read_web_session(cur, handle_hash, *, lock=False):
     sql = """SELECT user_id, access_token, refresh_token, token_expires_at,
                     EXISTS (SELECT 1 FROM snippet_private.legacy_email_holds WHERE user_id = w.user_id),
-                    (SELECT invalid_through FROM snippet_private.session_cutoffs WHERE user_id = w.user_id)
+                    (SELECT invalid_through FROM snippet_private.session_cutoffs WHERE user_id = w.user_id),
+                    EXISTS (SELECT 1 FROM snippet_private.auth_transitions
+                            WHERE user_id = w.user_id AND pending = 'recovery')
              FROM snippet_private.web_sessions w
              WHERE handle_hash = %s AND expires_at > clock_timestamp()"""
     cur.execute(sql + (" FOR UPDATE OF w" if lock else ""), (handle_hash,))
@@ -180,7 +279,9 @@ def discard_web_session(cur, handle_hash, version):
 
 
 def refresh_web_session(cur, handle_hash, row):
-    owner, access, refresh, expires, held, cutoff = row
+    owner, access, refresh, expires, held, cutoff, recovering = row
+    if recovering:
+        raise AuthError(503)
     try:
         check_access_state(held, cutoff, access)
         tokens = provider("POST", "/token?grant_type=refresh_token", body={"refresh_token": refresh})
@@ -211,7 +312,9 @@ def web_identity():
             row = read_web_session(cur, handle_hash)
         if row is None:
             break
-        owner, access, _, expires, held, cutoff = row
+        owner, access, _, expires, held, cutoff, recovering = row
+        if recovering:
+            raise AuthError(503)
         if expires < time.time() + 45:
             with store.cursor() as cur:
                 current = read_web_session(cur, handle_hash, lock=True)
@@ -242,8 +345,10 @@ def web_identity():
                 break
             if current[:4] != row[:4]:
                 continue
+            if current[6]:
+                raise AuthError(503)
             try:
-                check_access_state(*current[4:], access)
+                check_access_state(*current[4:6], access)
                 if not verified:
                     raise AuthError(401)
             except AuthError:
@@ -272,9 +377,20 @@ def api_identity():
     except (KeyError, IndexError, TypeError, ValueError):
         raise AuthError(401) from None
     with store.cursor() as cur:
-        check_account_access(cur, owner, token)
-        cur.execute("SELECT 1 FROM snippet_private.revoked_vscode_sessions WHERE id = %s", (provider_session_id,))
-        if cur.fetchone():
+        cur.execute(
+            """SELECT EXISTS (SELECT 1 FROM snippet_private.legacy_email_holds WHERE user_id = %(owner)s),
+                      (SELECT invalid_through FROM snippet_private.session_cutoffs WHERE user_id = %(owner)s),
+                      EXISTS (SELECT 1 FROM snippet_private.revoked_vscode_sessions WHERE id = %(session)s)
+                      OR EXISTS (
+                          SELECT 1 FROM snippet_private.auth_transitions WHERE user_id = %(owner)s AND
+                          (pending IS NOT NULL OR (oauth_invalid_through IS NOT NULL AND
+                           NOT snippet_private.oauth_session_after(%(session)s, %(owner)s, %(client)s,
+                                                                   oauth_invalid_through))))""",
+            {"session": provider_session_id, "owner": owner, "client": vscode_client()},
+        )
+        held, cutoff, denied = cur.fetchone()
+        check_access_state(held, cutoff, token)
+        if denied:
             raise AuthError(401)
     g.api_session_id = provider_session_id
     return owner
@@ -293,12 +409,14 @@ def revoke_vscode_grant():
     owner = web_identity()
     if not owner:
         return redirect(url_for("auth.login"), code=303)
-    path = "/user/oauth/grants?" + urlencode({"client_id": vscode_client()})
+    vscode_client()
     dashboard = request.form.get("dashboard") == "1"
     try:
-        provider("DELETE", path, token=g.web_token)
+        ticket, _ = stage_transition(owner, "oauth")
         with store.cursor() as cur:
-            cur.execute("DELETE FROM snippet_private.revoked_vscode_sessions WHERE user_id = %s", (owner,))
+            lock_transition(cur, owner, ticket)
+            revoke_provider_grant(g.web_token)
+            finish_transition(cur, owner, revoked=True)
     except (AuthError, psycopg2.Error):
         if not dashboard:
             raise
@@ -333,7 +451,7 @@ def login():
     authorization_id = pending_authorization()
     if request.method == "GET":
         return auth_page("login", authorization_id=authorization_id)
-    email = request.form.get("email", "").strip().lower()
+    email = form_email()
     password = request.form.get("password", "")
     if not valid_email(email) or not 1 <= len(password) <= 128:
         return auth_page("login", "Enter a valid email address and password.", 400, authorization_id=authorization_id)
@@ -351,6 +469,11 @@ def login():
     return redirect(url_for("home"), code=303)
 
 
+def form_email():
+    raw = request.form.get("email", "")
+    return raw.strip().lower() if len(raw) <= 320 else ""
+
+
 def valid_email(email):
     return len(email) <= 254 and EMAIL.fullmatch(email)
 
@@ -361,11 +484,11 @@ def register():
     if request.method == "GET":
         return auth_page("register", authorization_id=authorization_id)
 
-    email = request.form.get("email", "").strip().lower()
+    email = form_email()
     password = request.form.get("password", "")
     if not valid_email(email):
         return auth_page("register", "Enter a valid email address.", 400, authorization_id=authorization_id)
-    if not password or len(password.encode()) > 72:
+    if not password or len(password) > 72 or len(password.encode()) > 72:
         return auth_page("register", "Enter a password of up to 72 bytes.", 400, authorization_id=authorization_id)
 
     limit("register", email, 3, 40)
@@ -417,7 +540,7 @@ def request_email_link():
     authorization_id = None if recovery else pending_authorization()
     if request.method == "GET":
         return auth_page(mode, authorization_id=authorization_id)
-    email = request.form.get("email", "").strip().lower()
+    email = form_email()
     if not valid_email(email):
         return auth_page(mode, "Enter a valid email address.", 400, authorization_id=authorization_id)
     try:
@@ -466,7 +589,7 @@ def email_link():
     if recovery:
         handle = secrets.token_urlsafe(32)
         with store.cursor() as cur:
-            cur.execute("DELETE FROM snippet_private.email_flows WHERE expires_at <= now()")
+            prune_credentials(cur, "email_flows")
             if session.get("email_flow"):
                 cur.execute("DELETE FROM snippet_private.email_flows WHERE handle_hash = %s",
                             (digest(session["email_flow"]),))
@@ -484,22 +607,23 @@ def email_link():
     return redirect(url_for("auth.login"), code=303)
 
 
+def read_email_flow(cur, handle_hash):
+    cur.execute("""SELECT access_token, owner_id FROM snippet_private.email_flows
+                   WHERE handle_hash = %s AND expires_at > clock_timestamp()""", (handle_hash,))
+    return cur.fetchone()
+
+
 @bp.route("/auth/new-password", methods=["GET", "POST"])
 def new_password():
     handle = session.get("email_flow")
     if handle:
+        handle_hash = digest(handle)
         with store.cursor() as cur:
-            cur.execute(
-                """SELECT access_token, owner_id FROM snippet_private.email_flows
-                   WHERE handle_hash = %s AND expires_at > now() FOR UPDATE""",
-                (digest(handle),),
-            )
-            row = cur.fetchone()
-            if row:
-                access, owner = row
-                if request.method == "GET":
-                    return auth_page("reset")
-                return finish_password_reset(cur, owner, access, handle)
+            row = read_email_flow(cur, handle_hash)
+        if row:
+            if request.method == "GET":
+                return auth_page("reset")
+            return finish_password_reset(row[1], handle_hash)
         session.pop("email_flow", None)
     return auth_page("invalid_link", status=400)
 
@@ -511,47 +635,50 @@ def discard_provider_session(access):
         current_app.logger.warning("Could not revoke an unused email-flow session")
 
 
-def finish_password_reset(cur, owner, access, handle):
+def finish_password_reset(owner, handle_hash):
     password = request.form.get("password", "")
-    if not password or len(password.encode()) > 72 or password != request.form.get("password_confirmation"):
+    if (not password or len(password) > 72 or len(password.encode()) > 72
+            or password != request.form.get("password_confirmation")):
         return auth_page("reset", "Enter matching passwords of up to 72 bytes.", 400)
-    try:
-        provider("PUT", "/user", token=access, body={"password": password})
-    except AuthError as exc:
-        if exc.code in ("weak_password", "same_password"):
-            return auth_page("reset", "Choose a different, stronger password.", 400)
-        if exc.status not in (401, 403, 404):
-            raise
-        cur.execute("DELETE FROM snippet_private.email_flows WHERE handle_hash = %s", (digest(handle),))
-        session.pop("email_flow", None)
-        return auth_page("invalid_link", status=400)
 
-    # Supabase's password update revokes other sessions. Block outstanding JWTs in Snippo too.
-    cur.execute(
-        """INSERT INTO snippet_private.session_cutoffs VALUES (%s, floor(extract(epoch FROM clock_timestamp()))::bigint)
-           ON CONFLICT (user_id) DO UPDATE
-           SET invalid_through = greatest(session_cutoffs.invalid_through, excluded.invalid_through)""",
-        (owner,),
-    )
-    cur.execute("DELETE FROM snippet_private.web_sessions WHERE user_id = %s", (owner,))
-    # Consume this flow before revocation calls so a provider outage cannot allow replay.
-    cur.execute("DELETE FROM snippet_private.email_flows WHERE handle_hash = %s", (digest(handle),))
-    cur.connection.commit()
+    ticket, previous = stage_transition(owner, "recovery", flow=handle_hash)
+    with store.cursor() as cur:
+        lock_transition(cur, owner, ticket)
+        row = read_email_flow(cur, handle_hash)
+        if not row:
+            # No upstream mutation has run for this ticket.
+            restore_transition(cur, owner, previous)
+            return auth_page("invalid_link", status=400)
+        access = row[0]
+        try:
+            provider("PUT", "/user", token=access, body={"password": password})
+        except AuthError as exc:
+            weak = exc.code in ("weak_password", "same_password")
+            invalid = exc.status in (401, 403, 404)
+            if not (weak or invalid):
+                raise
+            restore_transition(cur, owner, previous)
+            if weak:
+                return auth_page("reset", "Choose a different, stronger password.", 400)
+            cur.execute("DELETE FROM snippet_private.email_flows WHERE handle_hash = %s", (handle_hash,))
+            session.pop("email_flow", None)
+            return auth_page("invalid_link", status=400)
+
+        if current_app.config["SNIPPET_VSCODE_CLIENT_ID"]:
+            revoke_provider_grant(access)
+        # If any provider or database step fails, the committed recovery barrier
+        # survives. A fresh verified recovery can retry with a different password.
+        cur.execute(
+            """INSERT INTO snippet_private.session_cutoffs VALUES (%s, floor(extract(epoch FROM clock_timestamp()))::bigint)
+               ON CONFLICT (user_id) DO UPDATE
+               SET invalid_through = greatest(session_cutoffs.invalid_through, excluded.invalid_through)""",
+            (owner,),
+        )
+        cur.execute("DELETE FROM snippet_private.web_sessions WHERE user_id = %s", (owner,))
+        cur.execute("DELETE FROM snippet_private.email_flows WHERE owner_id = %s", (owner,))
+        finish_transition(cur, owner, revoked=True)
     session.clear()
-
-    try:
-        client_id = current_app.config["SNIPPET_VSCODE_CLIENT_ID"]
-        if client_id:
-            try:
-                provider("DELETE", "/user/oauth/grants?" + urlencode({"client_id": client_id}), token=access)
-            except AuthError as exc:
-                if exc.status != 404:
-                    raise
-    except AuthError:
-        current_app.logger.warning("Could not revoke the previous VS Code consent after password reset")
-    finally:
-        discard_provider_session(access)
-
+    discard_provider_session(access)
     flash("Password changed. Sign in again on the website and in VS Code.", "registration")
     return redirect(url_for("auth.login"), code=303)
 
@@ -621,8 +748,21 @@ def consent():
     authorization_id = pending_authorization()
     if not authorization_id:
         abort(400, "Missing authorization request.")
-    if not web_identity():
+    owner = web_identity()
+    if not owner:
         return redirect(url_for("auth.login", authorization_id=authorization_id))
+    with store.cursor() as cur:
+        account_lock(cur, owner)
+        cur.execute("""SELECT pending IS NOT NULL OR oauth_invalid_through > statement_timestamp()
+                       FROM snippet_private.auth_transitions WHERE user_id = %s""", (owner,))
+        row = cur.fetchone()
+        if row and row[0]:
+            abort(503, "VS Code authorization is temporarily unavailable. Try again shortly.")
+        check_account_access(cur, owner, g.web_token)
+        return consent_for_authorization(authorization_id)
+
+
+def consent_for_authorization(authorization_id):
     path = "/oauth/authorizations/" + quote(authorization_id, safe="")
     fresh_approval = False
     try:

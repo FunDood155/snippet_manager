@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.2
+
+- Validate and limit library responses before showing snippet choices.
+- Preserve a newer saved session when signing out an earlier session.
+
 ## 1.1.1
 
 - Preserve a selected-code save while the same Snippo session renews. Stop when the server or account changes and distinguish that case from an unconfirmed save.

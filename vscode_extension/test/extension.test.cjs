@@ -119,7 +119,7 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
         if (waitForList) await waitForList(init.signal);
         if (offline) throw new Error('Offline');
         if (revokeList) return new Response(null, { status: 401 });
-        return Response.json([{ name: 'Snippet fixture', cat: 'Test', code: 'print(5)' }]);
+        return Response.json([{ sno: 37, name: 'Snippet fixture', cat: 'Test', code: 'print(5)' }]);
     });
     const load = Module._load;
     const loader = t.mock.method(Module, '_load', (name, ...args) => name === 'vscode' ? vscode : load(name, ...args));

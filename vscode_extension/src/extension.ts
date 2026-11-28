@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { AuthClient, credentialKey, SaveSessionChanged, SaveUnconfirmed, SignInRequest, SignInRequired } from './auth';
+import { AuthClient, boundedJson, credentialKey, SaveSessionChanged, SaveUnconfirmed, SignInRequest, SignInRequired, type Snippet } from './auth';
 import { buildTemplate } from './snippetTemplates';
 
 const namespace = 'code-snippet-manager';
@@ -12,10 +12,6 @@ const languages = {
 };
 const VS_CODE_LANGUAGE_ALIASES: Record<string, string> = {
     javascriptreact: 'javascript', typescriptreact: 'typescript', shell: 'shellscript',
-};
-type Snippet = {
-    sno: number; name: string; cat: string; code: string; language?: keyof typeof languages;
-    template?: boolean; used_at?: string;
 };
 type SnippetItem = vscode.QuickPickItem & { snippet?: Snippet };
 type BrowserResult = { code: string } | 'declined' | 'expired' | 'cancelled' | 'launch-failed';
@@ -192,7 +188,7 @@ export function activate(context: vscode.ExtensionContext) {
         ];
         picker.show();
         try {
-            const library = await auth.readLibrary<Snippet[]>('?' + filters.toString(), signal);
+            const library = await auth.readLibrary('?' + filters.toString(), signal);
             if (signal.aborted || generation !== initialGeneration) return;
             checkPickerSession = async () => {
                 if (!await library.isCurrent() && activePicker === picker) picker.hide();
@@ -203,7 +199,8 @@ export function activate(context: vscode.ExtensionContext) {
                 .sort((a, b) => b.used_at!.localeCompare(a.used_at!) || b.sno - a.sno).slice(0, 5);
             const recentIds = new Set(recent.map(snippet => snippet.sno));
             const item = (snippet: Snippet): SnippetItem => ({
-                label: snippet.name, description: [snippet.cat, snippet.language && languages[snippet.language]]
+                label: snippet.name, description: [snippet.cat, snippet.language && Object.hasOwn(languages, snippet.language)
+                    ? languages[snippet.language as keyof typeof languages] : undefined]
                     .filter(Boolean).join(' · '), detail: snippet.code, snippet,
             });
             picker.items = recent.length ? [
@@ -296,8 +293,8 @@ export function activate(context: vscode.ExtensionContext) {
 
             const response = await draft.save({name, cat, code, language: language.id});
             if (response.status === 201) {
-                const body = await response.json().catch(() => ({})) as {language?: unknown};
-                if (language.id && !body.language) {
+                const body = await boundedJson(response, 2 * 1024 * 1024).catch(() => undefined) as {language?: unknown} | undefined;
+                if (language.id && !body?.language) {
                     void vscode.window.showWarningMessage('Snippet saved. This server did not save its language.');
                 } else {
                     void vscode.window.showInformationMessage('Snippet saved to Snippo.');
@@ -306,6 +303,7 @@ export function activate(context: vscode.ExtensionContext) {
                 const message = {
                     400: 'The server rejected the snippet fields.',
                     409: 'A snippet with that name already exists.',
+                    422: 'Your library storage limit was reached. Delete a personal snippet or reduce its size.',
                     413: 'The snippet is too large to save.',
                     429: 'Snippo is busy. Try again later.',
                 }[response.status] ?? 'Snippo could not confirm the save. Check your library before trying again.';

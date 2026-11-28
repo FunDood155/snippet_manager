@@ -169,3 +169,80 @@ test('invalid and replayed exchange fail, transient renewal preserves credential
     await assert.rejects(auth.request('/api/snippets'), SignInRequired);
     assert.equal(await auth.hasSession(), false);
 });
+
+test('library accepts legacy and v2 rows without changing snippet text', async () => {
+    const code = ' α\r\n  {{literal}}\t';
+    const legacy = {sno: 1, name: 'Legacy', cat: 'Fixture', code};
+    const current = {sno: 2, name: 'Current', cat: 'Fixture', code, language: null, template: false, used_at: null};
+    const auth = new AuthClient(storage(), () => origin, async url =>
+        url.endsWith('/token') ? tokens('access', 'refresh') : Response.json([legacy, current]));
+    await auth.complete(new SignInRequest(config, origin), 'code', new AbortController().signal);
+    const result = await auth.readLibrary('?v=2', new AbortController().signal);
+    assert.deepEqual(result.items, [legacy, current]);
+    assert.equal(await result.isCurrent(), true);
+});
+
+test('library rejects malformed, excessive or duplicate rows and caps streamed bytes', async () => {
+    let body;
+    let stopped = false;
+    const fields = {sno: 3, name: 'Fixture', cat: 'Category', code: 'literal'};
+    const auth = new AuthClient(storage(), () => origin, async url =>
+        url.endsWith('/token') ? tokens('access', 'refresh') : body);
+    await auth.complete(new SignInRequest(config, origin), 'code', new AbortController().signal);
+    const read = () => auth.readLibrary('?v=2', new AbortController().signal);
+    for (const malformed of [{...fields, sno: -1}, {...fields, code: {}}, {...fields, language: '__proto__'},
+        {...fields, template: 'true'}, {...fields, used_at: 'yesterday'}]) {
+        body = Response.json([malformed]);
+        await assert.rejects(read(), /invalid snippet data/);
+    }
+    body = Response.json([fields, fields]);
+    await assert.rejects(read(), /invalid snippet data/);
+    body = Response.json(Array(1001).fill(fields));
+    await assert.rejects(read(), /invalid library/);
+    body = new Response(new ReadableStream({
+        start(controller) {
+            for (let index = 0; index < 4; index++) controller.enqueue(new Uint8Array(1024 * 1024));
+        },
+        cancel() { stopped = true; },
+    }), {headers: {'Content-Length': '10'}});
+    await assert.rejects(read(), /too large/);
+    assert.equal(stopped, true);
+    body = new Response(null, {status: 413});
+    await assert.rejects(read(), /Narrow your search/);
+});
+
+test('two auth clients keep a superseding sign-in while the earlier logout is in flight', async () => {
+    for (const failed of [false, true]) {
+        const secrets = storage();
+        let startRevoke, finishRevoke;
+        const started = new Promise(resolve => { startRevoke = resolve; });
+        const holdRevoke = new Promise(resolve => { finishRevoke = resolve; });
+        const earlier = new AuthClient(secrets, () => origin, async (url, init) => {
+            if (url.endsWith('/token')) return tokens('old', 'old-refresh', 1);
+            assert.equal(init.headers.Authorization, 'Bearer old');
+            startRevoke();
+            await holdRevoke;
+            if (failed) throw new Error('fixture network fault');
+            return new Response(null, {status: 204});
+        });
+        const later = new AuthClient(secrets, () => origin, async () => tokens('new', 'new-refresh'));
+        await earlier.complete(new SignInRequest(config, origin), 'code', new AbortController().signal);
+        const loggingOut = earlier.signOut();
+        await started;
+        await later.complete(new SignInRequest(config, origin), 'code', new AbortController().signal);
+        finishRevoke();
+        assert.equal(await loggingOut, !failed);
+        assert.equal(JSON.parse(await secrets.get(credentialKey)).tokens.access, 'new');
+    }
+});
+
+test('logout removes the intended session when revocation transport fails', async () => {
+    const secrets = storage();
+    const auth = new AuthClient(secrets, () => origin, async url => {
+        if (url.endsWith('/token')) return tokens('old', 'old-refresh');
+        throw new Error('offline fixture');
+    });
+    await auth.complete(new SignInRequest(config, origin), 'code', new AbortController().signal);
+    assert.equal(await auth.signOut(), false);
+    assert.equal(await auth.hasSession(), false);
+});

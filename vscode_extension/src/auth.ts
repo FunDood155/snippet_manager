@@ -10,13 +10,17 @@ type SecretStorage = {
 };
 
 type Configuration = { provider: string; clientId: string; redirectUri: string };
+export type Snippet = {
+    sno: number; name: string; cat: string; code: string;
+    language?: string | null; template?: boolean; used_at?: string | null;
+};
 type Tokens = { access: string; refresh: string; expires: number };
 type SavedSession = { origin: string; config: Configuration; tokens: Tokens };
 type PendingLibrary = {
     path: string;
     session: SavedSession;
     controller: AbortController;
-    result: Promise<{ items: unknown; session: SavedSession }>;
+    result: Promise<{ items: Snippet[]; session: SavedSession }>;
     readers: number;
 };
 type Callback = { scheme: string; authority: string; path: string; query: string; fragment: string };
@@ -27,6 +31,65 @@ export class SignInRequired extends Error {}
 export class AuthUnavailable extends Error {}
 export class SaveSessionChanged extends Error {}
 export class SaveUnconfirmed extends Error {}
+
+const libraryBytes = 3 * 1024 * 1024;
+const libraryRows = 1000;
+
+export async function boundedJson(response: Response, maxBytes: number): Promise<unknown> {
+    const length = Number(response.headers.get('Content-Length'));
+    if (length > maxBytes) {
+        void response.body?.cancel().catch(() => {});
+        throw new AuthUnavailable('The server response is too large.');
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new AuthUnavailable('The server returned an invalid response.');
+    const decoder = new TextDecoder('utf-8', {fatal: true});
+    let size = 0;
+    let text = '';
+    try {
+        for (;;) {
+            const {done, value} = await reader.read();
+            if (done) break;
+            size += value.byteLength;
+            if (size > maxBytes) {
+                void reader.cancel().catch(() => {});
+                throw new AuthUnavailable('The server response is too large.');
+            }
+            text += decoder.decode(value, {stream: true});
+        }
+        return JSON.parse(text + decoder.decode()) as unknown;
+    } catch (error) {
+        if (error instanceof AuthUnavailable) throw error;
+        void reader.cancel().catch(() => {});
+        throw new AuthUnavailable('The server returned an invalid or incomplete response.');
+    } finally {
+        reader.releaseLock();
+    }
+}
+
+function object(value: unknown): value is Record<string, unknown> {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function snippetList(value: unknown): Snippet[] {
+    const ids = new Set<number>();
+    if (!Array.isArray(value) || value.length > libraryRows) {
+        throw new AuthUnavailable('The server returned an invalid library. Narrow your search or use the web library.');
+    }
+    for (const row of value) {
+        if (!object(row) || typeof row.sno !== 'number' || !Number.isInteger(row.sno) ||
+                row.sno < 0 || row.sno > 2147483647 || ids.has(row.sno) ||
+                typeof row.name !== 'string' || typeof row.cat !== 'string' || typeof row.code !== 'string' ||
+                (row.language != null && (typeof row.language !== 'string' || !/^[a-z][a-z0-9_-]{0,31}$/.test(row.language))) ||
+                (row.template !== undefined && typeof row.template !== 'boolean') ||
+                (row.used_at != null && (typeof row.used_at !== 'string' || row.used_at.length > 40 ||
+                    !Number.isFinite(Date.parse(row.used_at))))) {
+            throw new AuthUnavailable('The server returned invalid snippet data.');
+        }
+        ids.add(row.sno);
+    }
+    return value as Snippet[];
+}
 
 export function trustedOrigin(input: string): string {
     const url = new URL(input);
@@ -98,8 +161,9 @@ export class AuthClient {
         if (!response.ok) {
             throw new AuthUnavailable('VS Code sign-in is unavailable on this server.');
         }
-        const data = await response.json() as Configuration;
-        if (!data.clientId || typeof data.clientId !== 'string' ||
+        const data = await boundedJson(response, 16384);
+        if (!object(data) || typeof data.provider !== 'string' || typeof data.clientId !== 'string' ||
+                !data.clientId || data.clientId.length > 128 ||
                 data.redirectUri !== origin + '/oauth/vscode/callback') {
             throw new AuthUnavailable('The server returned an invalid authorization configuration.');
         }
@@ -107,7 +171,7 @@ export class AuthClient {
         if (new URL(origin).protocol === 'https:' && new URL(provider).protocol !== 'https:') {
             throw new AuthUnavailable('The configured identity provider must use HTTPS.');
         }
-        return new SignInRequest({ ...data, provider }, origin);
+        return new SignInRequest({ provider, clientId: data.clientId, redirectUri: data.redirectUri }, origin);
     }
 
     private serialize<T>(action: () => Promise<T>): Promise<T> {
@@ -131,9 +195,10 @@ export class AuthClient {
                 await this.revoke(attempt.origin, tokens.access);
                 throw new SignInRequired();
             }
-            await this.save({ origin: attempt.origin, config: attempt.config, tokens });
+            const saved = { origin: attempt.origin, config: attempt.config, tokens };
+            await this.save(saved);
             if (signal.aborted || this.origin !== attempt.origin) {
-                await this.storage.delete(credentialKey);
+                await this.removeIfCurrent(saved);
                 await this.revoke(attempt.origin, tokens.access);
                 throw new SignInRequired();
             }
@@ -154,7 +219,7 @@ export class AuthClient {
         });
     }
 
-    async readLibrary<T>(query: string, signal: AbortSignal): Promise<{ items: T; isCurrent: () => Promise<boolean>; recordUse: (sno: number) => Promise<void> }> {
+    async readLibrary(query: string, signal: AbortSignal): Promise<{ items: Snippet[]; isCurrent: () => Promise<boolean>; recordUse: (sno: number) => Promise<void> }> {
         const saved = await this.load();
         signal.throwIfAborted();
         if (!saved) {
@@ -172,7 +237,7 @@ export class AuthClient {
                     throw new AuthUnavailable('The Snippo session changed.');
                 }
                 const {response, session} = await this.authorizeRequest(path, saved, controller.signal);
-                const items: unknown = await response.json();
+                const items = snippetList(await boundedJson(response, libraryBytes));
                 if (!this.sameSession(session, await this.load())) {
                     throw new AuthUnavailable('The Snippo session changed.');
                 }
@@ -193,7 +258,7 @@ export class AuthClient {
             });
             signal.throwIfAborted();
             return {
-                items: items as T,
+                items,
                 isCurrent: async () => this.sameSession(session, await this.load()),
                 recordUse: async sno => {
                     if (Number.isInteger(sno) && this.sameSession(session, await this.load())) {
@@ -246,7 +311,7 @@ export class AuthClient {
                 throw new SaveUnconfirmed();
             }
             if (response.status === 401) {
-                if (this.sameSession(session, await this.load())) await this.storage.delete(credentialKey);
+                await this.removeIfCurrent(session);
                 throw new SignInRequired();
             }
             return response;
@@ -278,8 +343,11 @@ export class AuthClient {
             signal?.throwIfAborted();
         }
         if (response.status === 401) {
-            if (this.sameSession(session, await this.load())) await this.storage.delete(credentialKey);
+            await this.removeIfCurrent(session);
             throw new SignInRequired();
+        }
+        if (response.status === 413 && path.startsWith('/api/snippets?')) {
+            throw new AuthUnavailable('The library result is too large. Narrow your search or use the web library.');
         }
         if (!response.ok) {
             throw new AuthUnavailable('The snippet server is currently unavailable.');
@@ -290,14 +358,15 @@ export class AuthClient {
     signOut(): Promise<boolean> {
         return this.serialize(async () => {
             const saved = await this.load(true);
+            let target = saved;
             let revoked = true;
             try {
                 if (saved) {
-                    const session = saved.tokens.expires <= Date.now() + 30_000 ? await this.refresh(saved) : saved;
-                    const response = await this.revoke(session.origin, session.tokens.access);
-                    if (response.status === 401 && session === saved) {
-                        const renewed = await this.refresh(saved);
-                        revoked = (await this.revoke(renewed.origin, renewed.tokens.access)).ok;
+                    target = saved.tokens.expires <= Date.now() + 30_000 ? await this.refresh(saved) : saved;
+                    const response = await this.revoke(target.origin, target.tokens.access);
+                    if (response.status === 401 && target === saved) {
+                        target = await this.refresh(saved);
+                        revoked = (await this.revoke(target.origin, target.tokens.access)).ok;
                     } else {
                         revoked = response.ok;
                     }
@@ -305,10 +374,17 @@ export class AuthClient {
             } catch (error) {
                 revoked = error instanceof SignInRequired;
             } finally {
-                await this.storage.delete(credentialKey);
+                if (target) await this.removeIfCurrent(target);
             }
             return revoked;
         });
+    }
+
+    private async removeIfCurrent(expected: SavedSession): Promise<void> {
+        // SecretStorage does not offer a cross-host compare-and-delete primitive.
+        if (this.sameSession(expected, await this.load(true))) {
+            await this.storage.delete(credentialKey);
+        }
     }
 
     private async load(allowOtherOrigin = false): Promise<SavedSession | undefined> {
@@ -319,7 +395,9 @@ export class AuthClient {
         try {
             const saved = JSON.parse(text) as SavedSession;
             if (trustedOrigin(saved.origin) === saved.origin && (allowOtherOrigin || saved.origin === this.origin) &&
-                    saved.tokens?.access && saved.tokens.refresh) {
+                    typeof saved.config?.clientId === 'string' && typeof saved.config.provider === 'string' &&
+                    typeof saved.config.redirectUri === 'string' && typeof saved.tokens?.access === 'string' &&
+                    typeof saved.tokens.refresh === 'string' && Number.isFinite(saved.tokens.expires)) {
                 return saved;
             }
         } catch {
@@ -348,9 +426,7 @@ export class AuthClient {
             }
             return renewed;
         } catch (error) {
-            if (error instanceof SignInRequired && this.sameSession(saved, await this.load(true))) {
-                await this.storage.delete(credentialKey);
-            }
+            if (error instanceof SignInRequired) await this.removeIfCurrent(saved);
             throw error;
         }
     }
@@ -367,10 +443,11 @@ export class AuthClient {
         if (!response.ok) {
             throw new AuthUnavailable('The identity provider is currently unavailable.');
         }
-        const data = await response.json() as {
-            access_token?: string; refresh_token?: string; expires_in?: number;
-        };
-        if (!data.access_token || !data.refresh_token || !data.expires_in || data.expires_in <= 0) {
+        const data = await boundedJson(response, 32768);
+        if (!object(data) || typeof data.access_token !== 'string' || !data.access_token ||
+                data.access_token.length > 8192 || typeof data.refresh_token !== 'string' ||
+                !data.refresh_token || data.refresh_token.length > 8192 ||
+                typeof data.expires_in !== 'number' || !Number.isFinite(data.expires_in) || data.expires_in <= 0) {
             throw new AuthUnavailable('The identity provider returned an invalid session.');
         }
         return { access: data.access_token, refresh: data.refresh_token, expires: Date.now() + data.expires_in * 1000 };

@@ -284,29 +284,9 @@ snippets
 
 # 🔄 Database Migration
 
-The project originally used SQLite during development.
-
-The migration script:
-
-```text
-migrate.py
-```
-
-was used to move the existing data into Supabase PostgreSQL.
-
-Migration flow:
-
-```text
-SQLite
-  ↓
-migrate.py
-  ↓
-Supabase PostgreSQL
-```
-
-The migration was completed and the migrated data was verified through the application and API.
-
-SQLite is no longer used as the production database.
+The project originally used SQLite. The legacy importer is retired. Use the
+versioned Supabase migrations and the dedicated runtime role described in
+[the authentication setup guide](docs/authentication.md).
 
 ---
 
@@ -347,7 +327,7 @@ Local development uses:
 Example:
 
 ```env
-DATABASE_URL=your_database_connection_string
+SNIPPET_DATABASE_URL=your_dedicated_snippet_app_connection_string
 ```
 
 The `.env` file is ignored by Git.

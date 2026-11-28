@@ -51,6 +51,7 @@ def create_app(config=None):
     )
     if config:
         app.config.update(config)
+    app.json.ensure_ascii = False
     app.register_blueprint(auth.bp)
     app.teardown_request(store.close_request_connection)
     app.jinja_env.globals["csrf_token"] = auth.csrf_token
@@ -64,6 +65,10 @@ def create_app(config=None):
     def authorize():
         if request.endpoint == "static":
             return
+        vercel_environment = os.getenv("VERCEL_ENV")
+        if ((os.getenv("VERCEL") or vercel_environment) and vercel_environment != "production"
+                and os.getenv("SNIPPET_ISOLATED_PREVIEW") != "1"):
+            abort(503, "This Preview requires an isolated database.")
         settings = app.config
         if (len(app.secret_key) < 32 or not settings["SUPABASE_PUBLISHABLE_KEY"]
                 or not valid_origin(settings["SUPABASE_URL"], local_http)
@@ -72,6 +77,8 @@ def create_app(config=None):
         if request.path.startswith("/api/"):
             g.owner = auth.api_identity()
         elif request.method == "POST":
+            if request.blueprint == "auth":
+                request.max_content_length = 16 * 1024
             auth.protect_form()
         if request.endpoint in library_endpoints | {"account_deletion", "recent_web"}:
             g.owner = auth.web_identity()
@@ -133,7 +140,7 @@ def create_app(config=None):
         category = request.args.get("category", "")
         scope = request.args.get("scope", "all")
         selection = {
-            "search": search if "\x00" not in search else "",
+            "search": search if len(search) <= 256 and "\x00" not in search else "",
             "category": category if "\x00" not in category else "",
             "scope": scope if scope in ("all", "personal", "defaults", "favorites") else "all",
         }
@@ -194,7 +201,10 @@ def create_app(config=None):
         metadata, error = (None, error) if error else snippet_metadata(request.form, fields[2], web=True)
         if error:
             return library_page(draft=request.form, error=error, status=400)
-        store.add_snippet(g.owner, *fields, **metadata)
+        try:
+            store.add_snippet(g.owner, *fields, **metadata)
+        except store.LibraryQuotaExceeded:
+            return library_page(draft=request.form, error=QUOTA_MESSAGE, status=409)
         flash("Snippet added.", "library-success")
         return library_redirect()
 
@@ -228,13 +238,17 @@ def create_app(config=None):
         # HTML forms normalize textarea newlines. Keep the original bytes for unchanged code.
         if normal_newlines(code) == normal_newlines(original):
             code = original
-        if duplicating:
-            store.add_snippet(g.owner, name, category, code, **metadata)
-            flash("Snippet duplicated.", "library-success")
-        elif store.edit_snippet(g.owner, sno, name, category, code, **metadata):
-            flash("Snippet updated.", "library-success")
-        else:
-            return library_page(error="Snippet not found.", status=404)
+        try:
+            if duplicating:
+                store.add_snippet(g.owner, name, category, code, **metadata)
+                flash("Snippet duplicated.", "library-success")
+            elif store.edit_snippet(g.owner, sno, name, category, code, **metadata):
+                flash("Snippet updated.", "library-success")
+            else:
+                return library_page(error="Snippet not found.", status=404)
+        except store.LibraryQuotaExceeded:
+            return library_page(draft=request.form, editor=request.endpoint, source_id=sno,
+                                error=QUOTA_MESSAGE, status=409)
         return library_redirect()
 
     @app.post("/favorites/<int:sno>")
@@ -295,8 +309,11 @@ def create_app(config=None):
         expected = request.form.get("expected", type=int) if confirmed else None
         if confirmed and (expected is None or not 0 < expected <= 2147483647 or (ids and expected != len(ids))):
             return library_page(error="Review the affected snippets again before confirming.", status=400)
-        with store.cursor(g.owner) as cur:
-            affected = store.category_targets(cur, g.owner, source, ids, expected, destination)
+        try:
+            with store.cursor(g.owner) as cur:
+                affected = store.category_targets(cur, g.owner, source, ids, expected, destination)
+        except store.LibraryQuotaExceeded:
+            return library_page(error=QUOTA_MESSAGE, status=409)
         if not affected or (ids and affected != len(ids)):
             return library_page(error="The selected personal snippets changed. Review and try again.", status=409)
         if confirmed:
@@ -307,9 +324,27 @@ def create_app(config=None):
     @app.get("/api/snippets")
     def get_snippets():
         extended = request.args.get("v") == "2"
-        rows, _ = store.list_snippets(g.owner, request.args.get("search"), request.args.get("category"),
-                                     extended=extended, language=normalize_language(request.args.get("language")) if extended else None)
-        return jsonify([snippet_json(row, extended) for row in rows])
+        search, category = request.args.get("search"), request.args.get("category")
+        if any(value and (len(value) > 256 or "\x00" in value) for value in (search, category)):
+            return jsonify(error="Use search and category filters of up to 256 characters."), 400
+        after, limit = request.args.get("after"), request.args.get("limit")
+        if after is not None or limit is not None:
+            after = bounded_integer(after if after is not None else "0", 2147483647)
+            limit = bounded_integer(limit if limit is not None else "40", 40)
+            if after is None or not limit:
+                return jsonify(error="Use an integer after cursor and a limit from 1 to 40."), 400
+        auth.limit("library-list", g.owner, 300, None)
+        try:
+            rows, cursor = store.api_library(
+                g.owner, after=after, limit=limit, search=search, category=category, extended=extended,
+                language=normalize_language(request.args.get("language")) if extended else None,
+            )
+        except store.LibraryResponseTooLarge:
+            return jsonify(error="The result is too large. Narrow your search or use the web library."), 413
+        response = jsonify([snippet_json(row, extended) for row in rows])
+        if cursor is not None:
+            response.headers["X-Snippo-Next-After"] = str(cursor)
+        return response
 
     @app.get("/api/snippets/<int:sno>")
     def get_snippet(sno):
@@ -331,7 +366,10 @@ def create_app(config=None):
         metadata, error = snippet_metadata(data, fields[2]) if extended else ({}, None)
         if error:
             return jsonify(error=error), 400
-        sno = store.add_snippet(g.owner, *fields, reject_duplicate=True, **metadata)
+        try:
+            sno = store.add_snippet(g.owner, *fields, reject_duplicate=True, **metadata)
+        except store.LibraryQuotaExceeded:
+            return jsonify(error=QUOTA_MESSAGE), 422
         if sno is None:
             return jsonify(error="Snippet already exists"), 409
         row = (sno, *fields, metadata.get("language"), metadata.get("template"), None)
@@ -353,6 +391,17 @@ def create_app(config=None):
         return "", 204
 
     return app
+
+
+QUOTA_MESSAGE = "Your library storage limit was reached. Delete a personal snippet or reduce its size and try again."
+
+
+def bounded_integer(value, maximum):
+    if len(value) <= 10 and value.isascii() and value.isdecimal():
+        number = int(value)
+        if number <= maximum:
+            return number
+    return None
 
 
 def valid_id(sno):

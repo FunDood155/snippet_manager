@@ -6,6 +6,18 @@ from flask import g, has_request_context
 
 
 DEFAULT_ID_MIN = 2_000_000_000
+LIBRARY_COUNT_LIMIT = 1000
+LIBRARY_BYTES_LIMIT = 16 * 1024 * 1024
+API_LIST_ROW_LIMIT = 1000
+API_LIST_BYTES_LIMIT = 3 * 1024 * 1024
+
+
+class LibraryQuotaExceeded(Exception):
+    pass
+
+
+class LibraryResponseTooLarge(Exception):
+    pass
 PERSONAL_FAVORITES = "snippet_private.favorite_personal_snippets"
 DEFAULT_FAVORITES = "snippet_private.favorite_default_snippets"
 FAVORITES_SQL = f"""
@@ -101,7 +113,7 @@ def library_page(owner, page, page_size, revision=None, **selection):
 
 
 def select_snippets(cur, owner, search=None, category=None, include_categories=False, scope="all", sort="default",
-                    include_favorites=False, page=None, page_size=None, extended=False, language=None):
+                    include_favorites=False, page=None, page_size=None, extended=False, language=None, api_window=None):
     defaults = visible_defaults_sql(extended)
     personal_and_defaults = PERSONAL_SQL + " UNION ALL " + defaults
     library, owners = {
@@ -135,7 +147,31 @@ def select_snippets(cur, owner, search=None, category=None, include_categories=F
         sql += " AND language = %s"
         params.append(language)
     order = SNIPPET_ORDERS[sort]
-    if page is None:
+    if api_window is not None:
+        after, maximum = api_window
+        if after is not None:
+            sql += " AND sno > %s"
+            params.append(after)
+        sql += " ORDER BY sno LIMIT %s"
+        params.append(maximum + 1)
+        # Account for JSON escaping before the payload leaves PostgreSQL.
+        # Fixed overhead covers bounded IDs, metadata, field names and delimiters.
+        sql = f"""WITH candidates AS MATERIALIZED ({sql}), sizes AS (
+                      SELECT sno, sum(octet_length(to_json(name)::text)::bigint +
+                                      octet_length(to_json(cat)::text)::bigint +
+                                      octet_length(to_json(code)::text)::bigint + 192)
+                                  OVER (ORDER BY sno) AS body_size
+                      FROM candidates
+                  ), totals AS (
+                      SELECT count(*) AS total FROM candidates
+                  )
+                  SELECT candidates.*, totals.total, sizes.body_size
+                  FROM totals LEFT JOIN (
+                      sizes JOIN candidates USING (sno)
+                  ) ON sizes.body_size <= %s
+                  ORDER BY candidates.sno"""
+        params.append(API_LIST_BYTES_LIMIT)
+    elif page is None:
         sql += " ORDER BY " + order
     else:
         recent_group = "UNION ALL SELECT *, true FROM recent_rows" if page == 1 else ""
@@ -170,6 +206,18 @@ def select_snippets(cur, owner, search=None, category=None, include_categories=F
         cur.execute(f"SELECT DISTINCT cat FROM {source} ORDER BY cat", owners)
         categories = cur.fetchall()
     return rows, categories
+
+def api_library(owner, *, after, limit, **filters):
+    maximum = limit if limit is not None else API_LIST_ROW_LIMIT
+    with cursor(owner) as cur:
+        rows, _ = select_snippets(cur, owner, api_window=(after, maximum), **filters)
+    total = rows[0][-2]
+    items = [row[:-2] for row in rows if row[0] is not None]
+    if (total and not items) or (limit is None and (total > maximum or total != len(items))):
+        raise LibraryResponseTooLarge
+    page = items[:maximum]
+    return page, page[-1][0] if limit is not None and len(page) < total else None
+
 
 def get_snippet(owner, sno, extended=False):
     sql = visible_defaults_sql(extended) if sno >= DEFAULT_ID_MIN else PERSONAL_SQL
@@ -238,18 +286,38 @@ def set_favorite(owner, sno, favorite):
         return cur.fetchone()[0]
 
 
-def lock_snippet_name(cur, owner, name):
-    cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{owner}:{name}",))
+def lock_library(cur, owner):
+    cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"snippet-library:{owner}",))
+
+
+def enforce_quota(cur, owner, fields, sno=None):
+    field_bytes = sum(len(value.encode("utf-8")) for value in fields)
+    cur.execute("""SELECT count(*), coalesce(sum(bytes), 0),
+                          max(bytes) FILTER (WHERE sno = %s)
+                   FROM (
+                       SELECT sno, octet_length(name)::bigint + octet_length(cat) + octet_length(code) AS bytes
+                       FROM public.snippets WHERE owner_id = %s
+                   ) AS owned""", (sno, owner))
+    count, stored_bytes, prior_bytes = cur.fetchone()
+    if sno is not None and prior_bytes is None:
+        return False
+    # Existing over-budget libraries can still edit without growing, and delete.
+    if sno is None and count >= LIBRARY_COUNT_LIMIT:
+        raise LibraryQuotaExceeded
+    if field_bytes > (prior_bytes or 0) and stored_bytes + field_bytes - (prior_bytes or 0) > LIBRARY_BYTES_LIMIT:
+        raise LibraryQuotaExceeded
+    return True
 
 
 def add_snippet(owner, name, cat, code, reject_duplicate=False, *, language=None, template=False):
     with cursor(owner) as cur:
-        # Serialize same-name writes per user. Existing web saves can still use duplicate names.
-        lock_snippet_name(cur, owner, name)
+        # Serialize quota and same-name checks per owner. Web saves may still use duplicate names.
+        lock_library(cur, owner)
         if reject_duplicate:
             cur.execute("SELECT 1 FROM public.snippets WHERE owner_id = %s AND name = %s LIMIT 1", (owner, name))
             if cur.fetchone():
                 return None
+        enforce_quota(cur, owner, (name, cat, code))
         cur.execute(
             "INSERT INTO public.snippets (owner_id, name, cat, code, language, template) "
             "VALUES (%s, %s, %s, %s, %s, %s) RETURNING sno",
@@ -262,7 +330,9 @@ def edit_snippet(owner, sno, name, cat, code, *, language=None, template=False):
     if sno >= DEFAULT_ID_MIN:
         return False
     with cursor(owner) as cur:
-        lock_snippet_name(cur, owner, name)
+        lock_library(cur, owner)
+        if not enforce_quota(cur, owner, (name, cat, code), sno):
+            return False
         cur.execute("UPDATE public.snippets SET name = %s, cat = %s, code = %s, language = %s, template = %s "
                     "WHERE sno = %s AND owner_id = %s", (name, cat, code, language, template, sno, owner))
         return cur.rowcount == 1
@@ -309,18 +379,32 @@ def category_counts(owner):
 
 def category_targets(cur, owner, source, ids, expected=None, destination=None):
     condition, values = ("sno = ANY(%s)", ids) if ids else ("cat = %s", source)
-    selection = f"SELECT sno FROM public.snippets WHERE owner_id = %s AND {condition}"
+    selection = f"FROM public.snippets WHERE owner_id = %s AND {condition}"
     if expected is None:
-        cur.execute(f"SELECT count(*) FROM ({selection}) AS targets", (owner, values))
-    else:
-        cur.execute(f"""
-            WITH targets AS MATERIALIZED ({selection} ORDER BY sno FOR UPDATE),
-            updated AS (
-                UPDATE public.snippets SET cat = %s
-                WHERE owner_id = %s AND sno IN (SELECT sno FROM targets)
-                    AND (SELECT count(*) FROM targets) = %s
-                RETURNING sno
-            )
-            SELECT count(*) FROM updated
-        """, (owner, values, destination, owner, expected))
-    return cur.fetchone()[0]
+        cur.execute(f"SELECT count(*) FROM public.snippets WHERE owner_id = %s AND {condition}", (owner, values))
+        return cur.fetchone()[0]
+    lock_library(cur, owner)
+    cur.execute(f"""
+        WITH targets AS MATERIALIZED (SELECT sno, cat {selection} ORDER BY sno FOR UPDATE),
+        changes AS (
+            SELECT count(*) AS matches,
+                   coalesce(sum(%s - octet_length(cat)), 0) AS growth
+            FROM targets
+        ), admitted AS (
+            SELECT matches = %s AND (growth <= 0 OR growth + (
+                SELECT coalesce(sum(octet_length(name)::bigint + octet_length(cat) + octet_length(code)), 0)
+                FROM public.snippets WHERE owner_id = %s
+            ) <= %s) AS allowed, matches FROM changes
+        ), updated AS (
+            UPDATE public.snippets SET cat = %s
+            WHERE owner_id = %s AND sno IN (SELECT sno FROM targets)
+              AND (SELECT allowed FROM admitted)
+            RETURNING sno
+        )
+        SELECT (SELECT count(*) FROM updated), matches = %s AND NOT allowed FROM admitted
+    """, (owner, values, len(destination.encode("utf-8")), expected, owner, LIBRARY_BYTES_LIMIT,
+          destination, owner, expected))
+    count, over_quota = cur.fetchone()
+    if over_quota:
+        raise LibraryQuotaExceeded
+    return count
