@@ -19,9 +19,12 @@ SNIPPET_ORDERS = {
     "newest": f"(sno >= {DEFAULT_ID_MIN}), sno DESC",
     "oldest": f"(sno >= {DEFAULT_ID_MIN}), sno ASC",
 }
-PERSONAL_SQL = "SELECT sno, name, cat, code FROM public.snippets WHERE owner_id = %s"
+RECENT_PERSONAL = "snippet_private.recent_personal_snippets"
+RECENT_DEFAULT = "snippet_private.recent_default_snippets"
+RECENTS_SQL = f"SELECT snippet_id, used_at FROM {RECENT_PERSONAL} UNION ALL SELECT snippet_id, used_at FROM {RECENT_DEFAULT}"
+PERSONAL_SQL = "SELECT sno, name, cat, code, language, template FROM public.snippets WHERE owner_id = %s"
 VISIBLE_DEFAULTS_SQL = """
-    SELECT d.sno, d.name, d.cat, d.code FROM public.default_snippets d
+    SELECT d.sno, d.name, d.cat, d.code, d.language, false AS template FROM public.default_snippets d
     WHERE NOT EXISTS (
         SELECT 1 FROM snippet_private.hidden_default_snippets h WHERE h.user_id = %s AND h.snippet_id = d.sno
     )
@@ -71,28 +74,30 @@ def cursor(owner=None):
 
 
 def list_snippets(owner, search=None, category=None, include_categories=False, scope="all", sort="default",
-                  include_favorites=False):
+                  include_favorites=False, extended=False, language=None):
     with cursor(owner) as cur:
-        return select_snippets(cur, owner, search, category, include_categories, scope, sort, include_favorites)
+        return select_snippets(cur, owner, search, category, include_categories, scope, sort, include_favorites,
+                               extended=extended, language=language)
 
 
 def library_page(owner, page, page_size, revision=None, **selection):
     with cursor(owner) as cur:
         rows, categories = select_snippets(cur, owner, include_categories=True, include_favorites=True,
-                                           page=page, page_size=page_size, **selection)
+                                           page=page, page_size=page_size, extended=True, **selection)
         total, current_revision = rows[0][-2:]
         if page > 1 and (rows[0][0] is None or revision not in (None, current_revision)):
             # Restart paging if another client changed the ordered result.
             page = 1
             rows, categories = select_snippets(cur, owner, include_categories=True, include_favorites=True,
-                                               page=page, page_size=page_size, **selection)
+                                               page=page, page_size=page_size, extended=True, **selection)
             total, current_revision = rows[0][-2:]
-        visible = [row[:-2] for row in rows if row[0] is not None]
-        return visible, categories, select_hidden_defaults(cur, owner), total, page, current_revision
+        recent = [row[:-4] for row in rows if row[-3]]
+        visible = [row[:-4] for row in rows if row[0] is not None and not row[-3]]
+        return visible, recent, categories, select_hidden_defaults(cur, owner), total, page, current_revision
 
 
 def select_snippets(cur, owner, search=None, category=None, include_categories=False, scope="all", sort="default",
-                    include_favorites=False, page=None, page_size=None):
+                    include_favorites=False, page=None, page_size=None, extended=False, language=None):
     personal_and_defaults = PERSONAL_SQL + " UNION ALL " + VISIBLE_DEFAULTS_SQL
     library, owners = {
         "all": (personal_and_defaults, (owner, owner)),
@@ -108,6 +113,11 @@ def select_snippets(cur, owner, search=None, category=None, include_categories=F
     fields = "sno, name, cat, code"
     if include_favorites:
         fields += ", favorites.snippet_id IS NOT NULL"
+    if extended:
+        fields += ", language, template"
+    if extended and page is None:
+        source += f" LEFT JOIN ({RECENTS_SQL}) AS recent ON recent.snippet_id = library.sno"
+        fields += ", recent.used_at"
     sql = f"SELECT {fields} FROM {source} WHERE true"
     params = list(owners)
     if search:
@@ -116,19 +126,38 @@ def select_snippets(cur, owner, search=None, category=None, include_categories=F
     if category:
         sql += " AND cat = %s"
         params.append(category)
+    if language:
+        sql += " AND language = %s"
+        params.append(language)
     order = SNIPPET_ORDERS[sort]
     if page is None:
         sql += " ORDER BY " + order
     else:
-        sql = f"""WITH filtered AS ({sql}), page_rows AS (
-                    SELECT * FROM filtered ORDER BY {order} LIMIT %s OFFSET %s
+        recent_group = "UNION ALL SELECT *, true FROM recent_rows" if page == 1 else ""
+        sql = f"""WITH filtered AS ({sql}), recent_rows AS (
+                    SELECT filtered.*, recent.used_at
+                    FROM ({RECENTS_SQL}) AS recent JOIN filtered ON filtered.sno = recent.snippet_id
+                    ORDER BY recent.used_at DESC, filtered.sno DESC LIMIT 5
+                ), recent_meta AS (
+                    SELECT count(*) AS size, coalesce(string_agg(sno::text, ',' ORDER BY sno), '') AS revision
+                    FROM recent_rows
+                ), page_rows AS (
+                    (SELECT *, NULL::timestamptz AS used_at, false AS is_recent
+                     FROM filtered WHERE sno NOT IN (SELECT sno FROM recent_rows)
+                     ORDER BY {order}
+                     LIMIT (%s - CASE WHEN %s THEN (SELECT size FROM recent_meta) ELSE 0 END)
+                     OFFSET greatest(0, %s - (SELECT size FROM recent_meta)))
+                    {recent_group}
                 ), totals AS (
-                    SELECT count(*) AS total, md5(string_agg(sno::text, ',' ORDER BY {order})) AS revision
+                    SELECT count(*) AS total,
+                        md5(string_agg(sno::text, ',' ORDER BY {order}) || ':' ||
+                            (SELECT revision FROM recent_meta)) AS revision
                     FROM filtered
                 )
                 SELECT page_rows.*, totals.total, totals.revision
-                FROM totals LEFT JOIN page_rows ON true ORDER BY {order}"""
-        params.extend((page_size, (page - 1) * page_size))
+                FROM totals LEFT JOIN page_rows ON true
+                ORDER BY is_recent DESC, used_at DESC NULLS LAST, {order}"""
+        params.extend((page_size, page == 1, (page - 1) * page_size))
     cur.execute(sql, params)
     rows = cur.fetchall()
     categories = []
@@ -137,10 +166,11 @@ def select_snippets(cur, owner, search=None, category=None, include_categories=F
         categories = cur.fetchall()
     return rows, categories
 
-def get_snippet(owner, sno):
+def get_snippet(owner, sno, extended=False):
     sql = VISIBLE_DEFAULTS_SQL if sno >= DEFAULT_ID_MIN else PERSONAL_SQL
     with cursor(owner) as cur:
-        cur.execute(f"SELECT sno, name, cat, code FROM ({sql}) AS library WHERE sno = %s", (owner, sno))
+        columns = "sno, name, cat, code, language, template" if extended else "sno, name, cat, code"
+        cur.execute(f"SELECT {columns} FROM ({sql}) AS library WHERE sno = %s", (owner, sno))
         return cur.fetchone()
 
 
@@ -207,7 +237,7 @@ def lock_snippet_name(cur, owner, name):
     cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{owner}:{name}",))
 
 
-def add_snippet(owner, name, cat, code, reject_duplicate=False):
+def add_snippet(owner, name, cat, code, reject_duplicate=False, *, language=None, template=False):
     with cursor(owner) as cur:
         # Serialize same-name writes per user. Existing web saves can still use duplicate names.
         lock_snippet_name(cur, owner, name)
@@ -216,19 +246,20 @@ def add_snippet(owner, name, cat, code, reject_duplicate=False):
             if cur.fetchone():
                 return None
         cur.execute(
-            "INSERT INTO public.snippets (owner_id, name, cat, code) VALUES (%s, %s, %s, %s) RETURNING sno",
-            (owner, name, cat, code),
+            "INSERT INTO public.snippets (owner_id, name, cat, code, language, template) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING sno",
+            (owner, name, cat, code, language, template),
         )
         return cur.fetchone()[0]
 
 
-def edit_snippet(owner, sno, name, cat, code):
+def edit_snippet(owner, sno, name, cat, code, *, language=None, template=False):
     if sno >= DEFAULT_ID_MIN:
         return False
     with cursor(owner) as cur:
         lock_snippet_name(cur, owner, name)
-        cur.execute("UPDATE public.snippets SET name = %s, cat = %s, code = %s WHERE sno = %s AND owner_id = %s",
-                    (name, cat, code, sno, owner))
+        cur.execute("UPDATE public.snippets SET name = %s, cat = %s, code = %s, language = %s, template = %s "
+                    "WHERE sno = %s AND owner_id = %s", (name, cat, code, language, template, sno, owner))
         return cur.rowcount == 1
 
 
@@ -238,3 +269,53 @@ def delete_snippet(owner, sno):
     with cursor(owner) as cur:
         cur.execute("DELETE FROM public.snippets WHERE owner_id = %s AND sno = %s", (owner, sno))
         return cur.rowcount == 1
+
+
+def record_recent(owner, sno):
+    shared = sno >= DEFAULT_ID_MIN
+    target = VISIBLE_DEFAULTS_SQL if shared else PERSONAL_SQL
+    table = RECENT_DEFAULT if shared else RECENT_PERSONAL
+    with cursor(owner) as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"snippet-recent:{owner}",))
+        cur.execute(f"""
+            INSERT INTO {table} (user_id, snippet_id, used_at)
+            SELECT %s, sno, clock_timestamp() FROM ({target}) AS library WHERE sno = %s
+            ON CONFLICT (user_id, snippet_id) DO UPDATE SET used_at = excluded.used_at
+        """, (owner, owner, sno))
+        if not cur.rowcount:
+            return False
+        cur.execute(f"""
+            DELETE FROM {table} WHERE user_id = %s AND snippet_id IN (
+                SELECT snippet_id FROM {table} WHERE user_id = %s
+                ORDER BY used_at DESC, snippet_id DESC OFFSET 20
+            )
+        """, (owner, owner))
+        return True
+
+
+def category_counts(owner):
+    with cursor(owner) as cur:
+        cur.execute("SELECT cat, count(*) FROM public.snippets WHERE owner_id = %s GROUP BY cat ORDER BY cat",
+                    (owner,))
+        personal = cur.fetchall()
+        cur.execute("SELECT DISTINCT cat FROM public.default_snippets ORDER BY cat")
+        return personal, cur.fetchall()
+
+
+def category_targets(cur, owner, source, ids, expected=None, destination=None):
+    condition, values = ("sno = ANY(%s)", ids) if ids else ("cat = %s", source)
+    selection = f"SELECT sno FROM public.snippets WHERE owner_id = %s AND {condition}"
+    if expected is None:
+        cur.execute(f"SELECT count(*) FROM ({selection}) AS targets", (owner, values))
+    else:
+        cur.execute(f"""
+            WITH targets AS MATERIALIZED ({selection} ORDER BY sno FOR UPDATE),
+            updated AS (
+                UPDATE public.snippets SET cat = %s
+                WHERE owner_id = %s AND sno IN (SELECT sno FROM targets)
+                    AND (SELECT count(*) FROM targets) = %s
+                RETURNING sno
+            )
+            SELECT count(*) FROM updated
+        """, (owner, values, destination, owner, expected))
+    return cur.fetchone()[0]

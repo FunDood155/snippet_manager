@@ -10,6 +10,7 @@ from flask import Flask, abort, flash, g, jsonify, redirect, render_template, re
 import auth
 import store
 from snippet_highlighting import highlight
+from snippet_metadata import LANGUAGES, normalize_language, valid_template
 
 load_dotenv()
 
@@ -54,9 +55,10 @@ def create_app(config=None):
     app.teardown_request(store.close_request_connection)
     app.jinja_env.globals["csrf_token"] = auth.csrf_token
     app.jinja_env.filters["highlight_snippet"] = highlight
+    app.jinja_env.globals["snippet_languages"] = LANGUAGES
     editor_endpoints = {"edit", "duplicate"}
     library_endpoints = {"home", "add", "delete", "hide_default", "restore_default", "restore_defaults",
-                         "favorite"} | editor_endpoints
+                         "favorite", "change_categories"} | editor_endpoints
 
     @app.before_request
     def authorize():
@@ -71,7 +73,7 @@ def create_app(config=None):
             g.owner = auth.api_identity()
         elif request.method == "POST":
             auth.protect_form()
-        if request.endpoint in library_endpoints | {"account_deletion"}:
+        if request.endpoint in library_endpoints | {"account_deletion", "recent_web"}:
             g.owner = auth.web_identity()
             if not g.owner:
                 return redirect(url_for("auth.login"), code=303)
@@ -135,6 +137,9 @@ def create_app(config=None):
             "category": category if "\x00" not in category else "",
             "scope": scope if scope in ("all", "personal", "defaults", "favorites") else "all",
         }
+        language = normalize_language(request.args.get("language"))
+        if language:
+            selection["language"] = language
         sort = request.args.get("sort")
         if sort in store.SNIPPET_ORDERS and sort != "default":
             selection["sort"] = sort
@@ -144,20 +149,26 @@ def create_app(config=None):
         return request.headers.get(FRAGMENT_HEADER) == "library"
 
     def library_page(draft=None, error=None, unavailable=False, status=200, editor="add",
-                     source_id=None, manage=None, reset_page=False):
+                     source_id=None, manage=None, reset_page=False, category_change=None):
         selection = filters()
         page = 1 if reset_page else min(2_147_483_647, max(1, request.args.get("page", 1, type=int)))
-        snippets, categories, hidden, total, revision = [], [], [], 0, None
+        snippets, recent, categories, hidden, total, revision = [], [], [], [], 0, None
+        manage_categories = request.endpoint == "change_categories" or request.args.get("categories") == "1"
+        personal_categories, shared_categories = [], []
         if not unavailable:
-            snippets, categories, hidden, total, page, revision = store.library_page(
+            snippets, recent, categories, hidden, total, page, revision = store.library_page(
                 g.owner, page, PAGE_SIZE, revision=request.args.get("revision"), **selection)
+            if manage_categories:
+                personal_categories, shared_categories = store.category_counts(g.owner)
         manage = request.args.get("manage") == "1" if manage is None else manage
         location = url_for("home" if editor == "add" else editor, sno=source_id, **selection,
                            page=page if page > 1 else None, revision=revision if page > 1 else None,
-                           manage=1 if manage else None,
+                           manage=1 if manage else None, categories=1 if manage_categories else None,
                            _anchor="hidden-defaults" if manage else None)
         template = "library_fragment.html" if is_fragment() else "index.html"
-        return render_template(template, snippets=snippets, categories=categories, total=total,
+        return render_template(template, snippets=snippets, recent=recent, categories=categories, total=total,
+                               manage_categories=manage_categories, personal_categories=personal_categories,
+                               shared_categories=shared_categories, category_change=category_change,
                                page=page, pages=max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE), revision=revision,
                                library_location=location, default_id_min=store.DEFAULT_ID_MIN,
                                selection=selection, hidden=hidden, manage_hidden=manage, draft=draft,
@@ -180,9 +191,10 @@ def create_app(config=None):
     @app.post("/add")
     def add():
         fields, error = snippet_fields(request.form)
+        metadata, error = (None, error) if error else snippet_metadata(request.form, fields[2], web=True)
         if error:
             return library_page(draft=request.form, error=error, status=400)
-        store.add_snippet(g.owner, *fields)
+        store.add_snippet(g.owner, *fields, **metadata)
         flash("Snippet added.", "library-success")
         return library_redirect()
 
@@ -199,15 +211,17 @@ def create_app(config=None):
         duplicating = request.endpoint == "duplicate"
         if not valid_id(sno) or (not duplicating and sno >= store.DEFAULT_ID_MIN):
             return library_page(error="Snippet not found.", status=404)
-        source = store.get_snippet(g.owner, sno)
+        source = store.get_snippet(g.owner, sno, extended=True)
         if source is None:
             return library_page(error="Snippet not found.", status=404)
-        _, name, category, original = source
+        _, name, category, original, language, template = source
         if request.method == "GET":
-            draft = {"name": name + " (copy)" if duplicating else name, "cat": category, "code": original}
+            draft = {"name": name + " (copy)" if duplicating else name, "cat": category, "code": original,
+                     "language": language, "template": template}
             return library_page(draft=draft, editor=request.endpoint, source_id=sno)
 
         fields, error = snippet_fields(request.form)
+        metadata, error = (None, error) if error else snippet_metadata(request.form, fields[2], web=True)
         if error:
             return library_page(draft=request.form, editor=request.endpoint, source_id=sno, error=error, status=400)
         name, category, code = fields
@@ -215,9 +229,9 @@ def create_app(config=None):
         if normal_newlines(code) == normal_newlines(original):
             code = original
         if duplicating:
-            store.add_snippet(g.owner, name, category, code)
+            store.add_snippet(g.owner, name, category, code, **metadata)
             flash("Snippet duplicated.", "library-success")
-        elif store.edit_snippet(g.owner, sno, name, category, code):
+        elif store.edit_snippet(g.owner, sno, name, category, code, **metadata):
             flash("Snippet updated.", "library-success")
         else:
             return library_page(error="Snippet not found.", status=404)
@@ -254,17 +268,56 @@ def create_app(config=None):
               "library-success" if count else "library-info")
         return library_redirect(manage=True)
 
+    def record_use(sno):
+        return ("", 204) if valid_id(sno) and store.record_recent(g.owner, sno) else ("", 404)
+
+    @app.post("/recent/<int:sno>")
+    def recent_web(sno):
+        return record_use(sno)
+
+    @app.post("/api/snippets/<int:sno>/recent")
+    def recent_api(sno):
+        return record_use(sno)
+
+    @app.post("/categories")
+    def change_categories():
+        raw_ids = request.form.getlist("snippet_ids")
+        source = request.form.get("source", "")
+        destination = request.form.get("destination", "")
+        if (not valid_category(destination) or len(raw_ids) > PAGE_SIZE
+                or any(not value.isascii() or not value.isdecimal() or len(value) > 10 for value in raw_ids)
+                or (not raw_ids and (not valid_category(source) or source == destination))):
+            return library_page(error="Choose personal snippets or a source category and a different destination.", status=400)
+        ids = sorted(set(map(int, raw_ids)))
+        if len(ids) != len(raw_ids) or any(not 0 < sno < store.DEFAULT_ID_MIN for sno in ids):
+            return library_page(error="Select valid personal snippets.", status=400)
+        confirmed = request.form.get("confirm") == "1"
+        expected = request.form.get("expected", type=int) if confirmed else None
+        if confirmed and (expected is None or not 0 < expected <= 2147483647 or (ids and expected != len(ids))):
+            return library_page(error="Review the affected snippets again before confirming.", status=400)
+        with store.cursor(g.owner) as cur:
+            affected = store.category_targets(cur, g.owner, source, ids, expected, destination)
+        if not affected or (ids and affected != len(ids)):
+            return library_page(error="The selected personal snippets changed. Review and try again.", status=409)
+        if confirmed:
+            flash(f"Moved {affected} {'snippet' if affected == 1 else 'snippets'}.", "library-success")
+            return redirect(url_for("home", categories=1, scope="personal", category=destination), code=303)
+        return library_page(category_change=dict(ids=ids, source=source, destination=destination, count=affected))
+
     @app.get("/api/snippets")
     def get_snippets():
-        rows, _ = store.list_snippets(g.owner, request.args.get("search"), request.args.get("category"))
-        return jsonify([snippet_json(row) for row in rows])
+        extended = request.args.get("v") == "2"
+        rows, _ = store.list_snippets(g.owner, request.args.get("search"), request.args.get("category"),
+                                     extended=extended, language=normalize_language(request.args.get("language")) if extended else None)
+        return jsonify([snippet_json(row, extended) for row in rows])
 
     @app.get("/api/snippets/<int:sno>")
     def get_snippet(sno):
-        row = store.get_snippet(g.owner, sno) if valid_id(sno) else None
+        extended = request.args.get("v") == "2"
+        row = store.get_snippet(g.owner, sno, extended=extended) if valid_id(sno) else None
         if row is None:
             return jsonify(error="Snippet not found"), 404
-        return jsonify(snippet_json(row))
+        return jsonify(snippet_json(row, extended))
 
     @app.post("/api/snippets")
     def add_snippet():
@@ -274,10 +327,15 @@ def create_app(config=None):
         fields, error = snippet_fields(data)
         if error:
             return jsonify(error=error), 400
-        sno = store.add_snippet(g.owner, *fields, reject_duplicate=True)
+        extended = request.args.get("v") == "2"
+        metadata, error = snippet_metadata(data, fields[2]) if extended else ({}, None)
+        if error:
+            return jsonify(error=error), 400
+        sno = store.add_snippet(g.owner, *fields, reject_duplicate=True, **metadata)
         if sno is None:
             return jsonify(error="Snippet already exists"), 409
-        return jsonify(message="Snippet added", **snippet_json((sno, *fields))), 201
+        row = (sno, *fields, metadata.get("language"), metadata.get("template"), None)
+        return jsonify(message="Snippet added", **snippet_json(row, extended)), 201
 
     @app.delete("/api/snippets/<int:sno>")
     def delete_snippet(sno):
@@ -305,8 +363,26 @@ def normal_newlines(value):
     return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def snippet_json(row):
-    return dict(zip(("sno", "name", "cat", "code"), row))
+def snippet_json(row, extended=False):
+    result = dict(zip(("sno", "name", "cat", "code"), row))
+    if extended:
+        result.update(language=row[4], template=row[5], used_at=row[6].isoformat() if len(row) > 6 and row[6] else None)
+    return result
+
+
+def valid_category(value):
+    return bool(value.strip()) and "\x00" not in value
+
+
+def snippet_metadata(data, code, web=False):
+    template = data.get("template", False)
+    if web:
+        template = template == "on"
+    elif not isinstance(template, bool):
+        return None, "Template mode must be true or false."
+    if template and not valid_template(code):
+        return None, "Use 1–20 named placeholders such as {{name}}. Names use letters, digits, or underscores and start with a letter or underscore."
+    return {"language": normalize_language(data.get("language")), "template": template}, None
 
 
 def snippet_fields(data):
@@ -320,6 +396,11 @@ def snippet_fields(data):
         return None, "name, cat and code cannot be empty"
     if any("\x00" in value for value in fields):
         return None, "name, cat and code cannot contain null characters"
+    try:
+        for value in fields:
+            value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None, "name, cat and code must contain valid text"
     return fields, None
 
 

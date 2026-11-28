@@ -40,6 +40,7 @@ STARTER_MIGRATION = next((ROOT / "supabase/migrations").glob("*_default_starter_
 PUBLIC_AUTH = next((ROOT / "supabase/migrations").glob("*_public_authentication.sql")).read_text()
 SHARED_DEFAULTS = next((ROOT / "supabase/migrations").glob("*_shared_default_snippets.sql")).read_text()
 FAVORITES_EDIT = next((ROOT / "supabase/migrations").glob("*_snippet_favorites_and_editing.sql")).read_text()
+PRODUCTIVITY = next((ROOT / "supabase/migrations").glob("*_developer_productivity.sql")).read_text()
 HIDDEN_DEFAULTS = next((ROOT / "supabase/migrations").glob("*_hidden_default_snippets.sql")).read_text()
 RETIRE_STARTERS = next((ROOT / "supabase/migrations").glob("*_retire_starter_copies.sql")).read_text()
 PUBLIC_UNDO = (ROOT / "supabase/rollback_public_authentication.sql").read_text()
@@ -211,6 +212,7 @@ class AppTest(unittest.TestCase):
                 cur.execute(SHARED_DEFAULTS)
                 cur.execute(HIDDEN_DEFAULTS)
                 cur.execute(FAVORITES_EDIT)
+                cur.execute(PRODUCTIVITY)
                 cur.execute("DELETE FROM snippet_private.legacy_email_holds WHERE user_id IN (%s, %s)", (A, B))
                 cur.execute("ALTER ROLE snippet_app LOGIN PASSWORD 'fixture-only'")
 
@@ -220,6 +222,7 @@ class AppTest(unittest.TestCase):
                 cur.execute("DELETE FROM public.snippets WHERE owner_id IS NOT NULL")
                 cur.execute("DELETE FROM snippet_private.hidden_default_snippets")
                 cur.execute("DELETE FROM snippet_private.favorite_default_snippets")
+                cur.execute("DELETE FROM snippet_private.recent_default_snippets")
                 cur.execute("""TRUNCATE snippet_private.web_sessions, snippet_private.auth_limits,
                     snippet_private.revoked_vscode_sessions, snippet_private.session_cutoffs, snippet_private.email_flows""")
         patches = (patch.dict(os.environ, {"SNIPPET_DATABASE_URL": self.runtime}),
@@ -421,6 +424,124 @@ class AppTest(unittest.TestCase):
         self.assertIn(b"Added to favorites.", response.data)
         self.assertEqual(self.browser.post(f"/favorites/{keys[0][0]}", headers=headers,
                                           data={"action": "remove"}).status_code, 400)
+
+    def test_productivity_metadata_and_legacy_api_contract(self):
+        code = '  \tprint({{value}}) # $HOME \r\n'
+        path = "/api/snippets?v=2"
+        payload = {"name": "Template", "cat": "Examples", "code": code, "language": "typescriptreact", "template": True}
+        response = self.browser.post(path, headers=self.api_a, json=payload)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual((response.json["language"], response.json["template"], response.json["code"]),
+                         ("typescript", True, code))
+        self.assertEqual(self.browser.post(path, headers=self.api_a, json=payload).status_code, 409)
+        self.assertEqual(self.browser.post(path, headers=self.api_a, json={**payload, "name": "bad", "code": "{{bad-name}}"}).status_code, 400)
+        self.assertEqual(self.browser.post(path, headers=self.api_a, json={**payload, "name": "bad", "template": "false"}).status_code, 400)
+        sno = response.json["sno"]
+        self.assertEqual(set(self.browser.get(f"/api/snippets/{sno}", headers=self.api_a).json), {"sno", "name", "cat", "code"})
+        self.assertEqual(self.browser.get(path + "&language=typescript", headers=self.api_b).json, [])
+        self.assertEqual(len(self.browser.get(path + "&language=typescript", headers=self.api_a).json), 1)
+        fallback = self.browser.post(path, headers=self.api_a, json={**payload, "name": "Rust", "language": "rust"})
+        self.assertIsNone(fallback.json["language"])
+        legacy = self.browser.post("/api/snippets", headers=self.api_a,
+                                   json={**payload, "name": "Old POST", "code": "${1:literal}"})
+        self.assertEqual(legacy.status_code, 201)
+        self.assertNotIn("language", legacy.json)
+        self.login()
+        editor = self.browser.get(f"/duplicate/{sno}").text
+        self.assertRegex(editor, r'<option value="typescript"\s+selected')
+        self.assertIn('name="template" checked', editor)
+        self.assertIn("1 snippet", self.browser.get("/?language=typescript").text)
+        self.assertIsNone(main.highlight("print('legacy')", "Python", "plaintext"))
+        self.assertIsNotNone(main.highlight("print('legacy')", "Examples"))
+
+    def test_productivity_recents_are_bounded_scoped_and_filtered(self):
+        self.login()
+        token = csrf(self.browser, "/")
+        with store.cursor(A) as cur:
+            cur.execute("""INSERT INTO public.snippets (owner_id, name, cat, code)
+                           SELECT %s, 'Recent ' || n, 'Fixture', 'body' FROM generate_series(1, 42) n
+                           RETURNING sno""", (A,))
+            ids = [row[0] for row in cur.fetchall()]
+        for sno in ids[-22:]:
+            self.assertEqual(self.browser.post(f"/api/snippets/{sno}/recent", headers=self.api_a).status_code, 204)
+        self.assertEqual(self.browser.post(f"/api/snippets/{ids[0]}/recent", headers=self.api_b).status_code, 404)
+        self.assertEqual(self.browser.post(f"/recent/{ids[0]}", data={}).status_code, 400)
+        self.assertEqual(self.browser.post(f"/recent/{ids[0]}", data={"csrf_token": token}).status_code, 204)
+        with store.cursor(A) as cur:
+            cur.execute("SELECT count(*) FROM snippet_private.recent_personal_snippets")
+            self.assertEqual(cur.fetchone()[0], 20)
+        with store.cursor(B) as cur:
+            cur.execute("SELECT count(*) FROM snippet_private.recent_personal_snippets")
+            self.assertEqual(cur.fetchone()[0], 0)
+            with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+                cur.execute("INSERT INTO snippet_private.recent_personal_snippets VALUES (%s, %s, now())", (A, ids[0]))
+            cur.connection.rollback()
+        page = self.browser.get("/?scope=personal").text
+        section = page.partition('id="recent-title"')[2].partition("</section>")[0]
+        self.assertEqual(re.findall(r'data-snippet-id="(\d+)"', section),
+                         [str(i) for i in [ids[0], *reversed(ids[-4:])]])
+        self.assertEqual(page.count("data-snippet-id="), 40)
+        second = self.browser.get("/?scope=personal&page=2").text
+        self.assertEqual(second.count("data-snippet-id="), 2)
+        self.assertNotIn('id="recent-title"', second)
+        self.assertNotIn('id="recent-title"', self.browser.get("/?category=Other").text)
+        shared = 2_000_000_000
+        self.assertEqual(self.browser.post(f"/api/snippets/{shared}/recent", headers=self.api_a).status_code, 204)
+        store.hide_default(A, shared)
+        self.assertEqual(self.browser.post(f"/api/snippets/{shared}/recent", headers=self.api_a).status_code, 404)
+        self.assertNotIn('id="recent-title"', self.browser.get("/?scope=defaults").text)
+        store.restore_default(A, shared)
+        self.assertIn('id="recent-title"', self.browser.get("/?scope=defaults").text)
+        self.assertTrue(store.delete_snippet(A, ids[0]))
+        with store.cursor(A) as cur:
+            cur.execute("SELECT count(*) FROM snippet_private.recent_personal_snippets")
+            self.assertEqual(cur.fetchone()[0], 19)
+
+    def test_recent_preferences_require_private_role_and_cascade_on_account_deletion(self):
+        user = self.create_account()
+        self.assertTrue(store.record_recent(user, 2_000_000_000))
+        with closing(psycopg2.connect(self.admin)) as conn, conn, conn.cursor() as cur:
+            cur.execute("""SELECT c.relrowsecurity, c.relforcerowsecurity,
+                                  has_any_column_privilege('authenticated', c.oid, 'SELECT'),
+                                  has_any_column_privilege('anon', c.oid, 'SELECT'),
+                                  has_any_column_privilege('service_role', c.oid, 'SELECT')
+                           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                           WHERE n.nspname = 'snippet_private'
+                             AND c.relname IN ('recent_personal_snippets', 'recent_default_snippets')""")
+            self.assertEqual(cur.fetchall(), [(True, True, False, False, False)] * 2)
+            cur.execute("SELECT has_column_privilege('snippet_app','public.default_snippets','language','UPDATE')")
+            self.assertFalse(cur.fetchone()[0])
+            cur.execute("DELETE FROM auth.users WHERE id = %s", (user,))
+            cur.execute("SELECT count(*) FROM snippet_private.recent_default_snippets WHERE user_id = %s", (user,))
+            self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_category_review_confirm_merge_and_owner_scope(self):
+        self.login()
+        token = csrf(self.browser, "/")
+        first = store.add_snippet(A, "A1", "Source", "code", language="html")
+        second = store.add_snippet(A, "A2", "Source", "  code ")
+        store.add_snippet(A, "A3", "Existing", "code")
+        foreign = store.add_snippet(B, "B1", "Source", "code")
+        store.set_favorite(A, second, True)
+        store.record_recent(A, second)
+        form = {"csrf_token": token, "source": "Source", "destination": "Existing"}
+        self.assertEqual(self.browser.post("/categories", data={"destination": "X"}).status_code, 400)
+        review = self.browser.post("/categories", data=form)
+        self.assertIn("Move 2 personal snippets", review.text)
+        self.assertEqual(store.get_snippet(A, first)[2], "Source")
+        self.assertEqual(self.browser.post("/categories", data={**form, "confirm": "1", "expected": "3"}).status_code, 409)
+        response = self.browser.post("/categories", data={**form, "confirm": "1", "expected": "2"})
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(store.get_snippet(A, first, extended=True)[2:], ("Existing", "code", "html", False))
+        self.assertEqual(store.get_snippet(B, foreign)[2], "Source")
+        self.assertEqual(self.browser.post("/categories", data={
+            "csrf_token": token, "snippet_ids": [first, foreign], "destination": "Only one",
+        }).status_code, 409)
+        selected = {"csrf_token": token, "snippet_ids": [second], "destination": "Moved"}
+        self.assertIn("Move 1 personal snippet", self.browser.post("/categories", data=selected).text)
+        self.assertEqual(self.browser.post("/categories", data={**selected, "confirm": "1", "expected": "1"}).status_code, 303)
+        self.assertEqual(store.get_snippet(A, second)[2:], ("Moved", "  code "))
+        self.assertIn('id="recent-title"', self.browser.get("/?scope=favorites&category=Moved").text)
 
     def test_registration_shows_verification_instructions_and_provisions_starters_once(self):
         email = "new@sample.test"
@@ -1392,6 +1513,8 @@ class AppTest(unittest.TestCase):
         ownership_rollback = UNDO.strip().removeprefix("BEGIN;").removesuffix("COMMIT;")
         public_rollback = PUBLIC_UNDO.split("BEGIN;", 1)[1].removesuffix("COMMIT;\n")
         rollback_body = (
+            "DROP TABLE snippet_private.recent_personal_snippets, snippet_private.recent_default_snippets;"
+            "ALTER TABLE public.snippets DROP COLUMN language, DROP COLUMN template;"
             "DROP TABLE snippet_private.favorite_personal_snippets, snippet_private.favorite_default_snippets;"
             "ALTER TABLE public.snippets DROP CONSTRAINT snippets_owner_sno_key;"
             "DROP POLICY snippets_update_owned ON public.snippets;"

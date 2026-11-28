@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0
+
+- Save explicitly selected code from the editor with a name, category and optional language.
+- Show recent successful uses and language labels in the picker.
+- Insert opt-in named placeholders with native VS Code tab stops.
+
 ## 1.0.1
 
 - Shows a cancellable loading picker while Show, Search, and Insert fetch authorized snippets.

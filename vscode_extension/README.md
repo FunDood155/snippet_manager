@@ -48,3 +48,16 @@ Report bugs at [GitHub Issues](https://github.com/FunDood155/snippet_manager/iss
 ## License
 
 Snippo is licensed under the [MIT License](https://opensource.org/license/mit). The full license and copyright notice are included in the VSIX.
+
+
+## Save selected code and insert templates
+
+Select one nonempty block and choose **Snippo: Save Selected Code** from the editor context menu or Command Palette. Choose a name, category and optional language. Confirm **Save** to send the selected text to your configured Snippo server. Cancel at any prompt to leave the selection unsent. A name conflict leaves the existing snippet intact.
+
+The picker shows up to five recent matching snippets for your account. A successful insert records usage in the background. Web copies also contribute to this list. Search the picker by name, category or language label. Snippo recognizes Python, JavaScript, TypeScript, HTML, CSS, SQL, JSON, Shell and Plain text. Other editor languages default to Unspecified.
+
+Select **Use named placeholders in VS Code** when adding or editing a personal snippet on the website. A field such as {{name}} becomes a native tab stop. Repeated names share one stop. Use 1–20 occurrences, with names 1–24 characters long, starting with an ASCII letter or underscore and continuing with letters, digits or underscores. Template mode starts off. Leave it off for literal brace syntax. Web copy preserves the literal source. VS Code 1.0.0 and 1.0.1 insert template source literally.
+
+### Assign keyboard shortcuts
+
+Open **Preferences: Open Keyboard Shortcuts**, search for **Snippo: Insert Snippet**, **Snippo: Show Snippets** or **Snippo: Save Selected Code**, then select the pencil and choose an unused binding. Use **Show Same Keybindings** to check for conflicts. In `keybindings.json`, use `editorTextFocus` for Insert and `editorTextFocus && editorHasSelection && !editorHasMultipleSelections` for Save Selected Code. Snippo leaves default system and editor shortcuts available.

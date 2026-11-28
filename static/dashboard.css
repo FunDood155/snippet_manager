@@ -302,3 +302,15 @@ pre code { font: inherit; }
     gap: .75rem;
     margin-top: 1rem;
 }
+
+.filters { grid-template-columns: minmax(0, 1fr) minmax(7rem, 12rem) minmax(7rem, 10rem) auto; }
+.filters select { width: 100%; }
+.template-toggle { display: flex; align-items: center; gap: .45rem; }
+.recent-snippets { margin-bottom: 1rem; }
+.recent-snippets > h2, .category-management h2 { font-size: 1rem; }
+.category-management form { display: grid; gap: .5rem; margin-block: .75rem; }
+.category-management button { justify-self: start; }
+@media (max-width: 650px) {
+    .filters { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .filters .search { grid-column: 1 / -1; }
+}

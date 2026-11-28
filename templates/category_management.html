@@ -1,0 +1,53 @@
+{% from 'library_forms.html' import form_token with context %}
+{% if manage_categories and not unavailable %}
+    <section class="hidden-defaults category-management" aria-labelledby="category-title">
+        <h2 id="category-title">Manage categories</h2>
+        <a data-library-nav href="{{ url_for('home', **selection) }}">Close category management</a>
+        {% if category_change %}
+            <form method="post" action="{{ url_for('change_categories', **selection) }}">
+                {{ form_token() }}
+                <input type="hidden" name="source" value="{{ category_change.source }}">
+                <input type="hidden" name="destination" value="{{ category_change.destination }}">
+                <input type="hidden" name="expected" value="{{ category_change.count }}">
+                <input type="hidden" name="confirm" value="1">
+                {% for sno in category_change.ids %}<input type="hidden" name="snippet_ids" value="{{ sno }}">{% endfor %}
+                <p>Move {{ category_change.count }} personal {{ 'snippet' if category_change.count == 1 else 'snippets' }}
+                   {% if not category_change.ids %}from <strong>{{ category_change.source }}</strong>{% endif %}
+                   to <strong>{{ category_change.destination }}</strong>?
+                   If the destination exists, the snippets join that category.</p>
+                <button class="primary" type="submit">Confirm category change</button>
+                <a href="{{ url_for('home', categories=1, **selection) }}">Cancel</a>
+            </form>
+        {% else %}
+            {% if personal_categories %}
+                <ul>
+                    {% for category, count in personal_categories %}<li>{{ category }} ({{ count }})</li>{% endfor %}
+                </ul>
+                <datalist id="personal-category-options">
+                    {% for category, count in personal_categories %}<option value="{{ category }}">{% endfor %}
+                </datalist>
+                <form method="post" action="{{ url_for('change_categories', **selection) }}">
+                    {{ form_token() }}
+                    <label>Personal category
+                        <select name="source" required>
+                            {% for category, count in personal_categories %}<option value="{{ category }}">{{ category }} ({{ count }})</option>{% endfor %}
+                        </select>
+                    </label>
+                    <label>New or existing category <input name="destination" list="personal-category-options" required></label>
+                    <button class="quiet" type="submit">Review rename or move all</button>
+                </form>
+                <form id="category-selection" method="post" action="{{ url_for('change_categories', **selection) }}">
+                    {{ form_token() }}
+                    <p>Select personal snippets on this page to move them together.</p>
+                    <label>Category for selected snippets <input name="destination" list="personal-category-options" required></label>
+                    <button class="quiet" type="submit">Review move selected</button>
+                </form>
+            {% else %}
+                <p>You have no personal categories yet.</p>
+            {% endif %}
+            <p>Shared categories (read-only){% if shared_categories %} · {{ shared_categories|map(attribute=0)|join(', ') }}{% endif %}</p>
+        {% endif %}
+    </section>
+{% elif not unavailable %}
+    <p class="sort-note"><a data-library-nav href="{{ url_for('home', categories=1, **selection) }}">Manage categories</a></p>
+{% endif %}

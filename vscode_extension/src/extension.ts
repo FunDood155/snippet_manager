@@ -1,12 +1,23 @@
 import * as vscode from 'vscode';
 import { AuthClient, credentialKey, SignInRequest, SignInRequired } from './auth';
+import { buildTemplate } from './snippetTemplates';
 
 const namespace = 'code-snippet-manager';
 const configuration = () => vscode.workspace.getConfiguration('snippetManager');
 const server = () => configuration().get<string>('serverUrl', '');
 
-type Snippet = { name: string; cat: string; code: string };
-type SnippetItem = vscode.QuickPickItem & { code: string };
+const languages = {
+    python: 'Python', javascript: 'JavaScript', typescript: 'TypeScript', html: 'HTML', css: 'CSS',
+    sql: 'SQL', json: 'JSON', shellscript: 'Shell', plaintext: 'Plain text',
+};
+const VS_CODE_LANGUAGE_ALIASES: Record<string, string> = {
+    javascriptreact: 'javascript', typescriptreact: 'typescript', shell: 'shellscript',
+};
+type Snippet = {
+    sno: number; name: string; cat: string; code: string; language?: keyof typeof languages;
+    template?: boolean; used_at?: string;
+};
+type SnippetItem = vscode.QuickPickItem & { snippet?: Snippet };
 type BrowserResult = { code: string } | 'declined' | 'expired' | 'cancelled' | 'launch-failed';
 
 export function activate(context: vscode.ExtensionContext) {
@@ -17,6 +28,7 @@ export function activate(context: vscode.ExtensionContext) {
     let activePicker: vscode.QuickPick<SnippetItem> | undefined;
     let checkPickerSession: (() => Promise<void>) | undefined;
     let generation = 0;
+    let saving = false;
 
     async function updateStatus() {
         const signedIn = await auth.hasSession();
@@ -151,13 +163,13 @@ export function activate(context: vscode.ExtensionContext) {
 
     async function pickSnippets(mode: 'show' | 'search' | 'insert') {
         const initialGeneration = generation;
-        let query = '';
+        const filters = new URLSearchParams({ v: '2' });
         if (mode === 'search') {
             if (!await auth.hasSession()) throw new SignInRequired();
             if (generation !== initialGeneration) return;
             const search = await vscode.window.showInputBox({ placeHolder: 'Search snippets...' });
             if (search === undefined || generation !== initialGeneration) return;
-            query = '?' + new URLSearchParams({ search }).toString();
+            filters.set('search', search);
         }
 
         activePicker?.hide();
@@ -166,6 +178,7 @@ export function activate(context: vscode.ExtensionContext) {
         checkPickerSession = undefined;
         picker.placeholder = { show: 'Select a snippet...', search: 'Search results',
             insert: 'Select a snippet to insert...' }[mode];
+        picker.matchOnDescription = true;
         picker.busy = true;
         const controller = new AbortController();
         const signal = controller.signal;
@@ -179,26 +192,47 @@ export function activate(context: vscode.ExtensionContext) {
         ];
         picker.show();
         try {
-            const library = await auth.readLibrary<Snippet[]>(query, signal);
+            const library = await auth.readLibrary<Snippet[]>('?' + filters.toString(), signal);
             if (signal.aborted || generation !== initialGeneration) return;
             checkPickerSession = async () => {
                 if (!await library.isCurrent() && activePicker === picker) picker.hide();
             };
             await checkPickerSession();
             if (signal.aborted || generation !== initialGeneration) return;
-            picker.items = library.items.map(snippet => ({
-                label: snippet.name, description: snippet.cat, detail: snippet.code, code: snippet.code,
-            }));
+            const recent = library.items.filter(snippet => snippet.used_at)
+                .sort((a, b) => b.used_at!.localeCompare(a.used_at!) || b.sno - a.sno).slice(0, 5);
+            const recentIds = new Set(recent.map(snippet => snippet.sno));
+            const item = (snippet: Snippet): SnippetItem => ({
+                label: snippet.name, description: [snippet.cat, snippet.language && languages[snippet.language]]
+                    .filter(Boolean).join(' · '), detail: snippet.code, snippet,
+            });
+            picker.items = recent.length ? [
+                {label: 'Recently used', kind: vscode.QuickPickItemKind.Separator},
+                ...recent.map(item),
+                {label: 'Library', kind: vscode.QuickPickItemKind.Separator},
+                ...library.items.filter(snippet => !recentIds.has(snippet.sno)).map(item),
+            ] : library.items.map(item);
             picker.busy = false;
             const selected = await selection;
-            if (mode !== 'insert' || !selected || signal.aborted || generation !== initialGeneration ||
+            if (mode !== 'insert' || !selected?.snippet || signal.aborted || generation !== initialGeneration ||
                     !await library.isCurrent() || signal.aborted || generation !== initialGeneration) return;
             const editor = vscode.window.activeTextEditor;
             if (!editor) {
                 void vscode.window.showErrorMessage('No active editor found');
                 return;
             }
-            await editor.edit(builder => builder.insert(editor.selection.active, selected.code));
+            const snippet = selected.snippet;
+            const position = editor.selection.active;
+            let inserted: boolean;
+            if (snippet.template === true) {
+                const template = new vscode.SnippetString();
+                inserted = buildTemplate(snippet.code, template)
+                    ? await editor.insertSnippet(template, position, {undoStopBefore: true, undoStopAfter: true, keepWhitespace: true})
+                    : await editor.edit(builder => builder.insert(position, snippet.code));
+            } else {
+                inserted = await editor.edit(builder => builder.insert(position, snippet.code));
+            }
+            if (inserted) void library.recordUse(snippet.sno).catch(() => {});
         } catch (error) {
             if (!signal.aborted) throw error;
         } finally {
@@ -211,6 +245,69 @@ export function activate(context: vscode.ExtensionContext) {
             }
         }
     }
+
+    register('saveSelectedCode', async () => {
+        if (saving) return;
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || editor.selections.length !== 1 || editor.selection.isEmpty) {
+            void vscode.window.showInformationMessage('Select one nonempty block of code to save to Snippo.');
+            return;
+        }
+        const code = editor.document.getText(editor.selection);
+        if (!code.trim()) {
+            void vscode.window.showInformationMessage('The selected code is blank.');
+            return;
+        }
+        if (Buffer.byteLength(JSON.stringify(code), 'utf8') >= 1024 * 1024) {
+            void vscode.window.showWarningMessage('The selected code is too large to save to Snippo.');
+            return;
+        }
+
+        saving = true;
+        const initialGeneration = generation;
+        try {
+            const save = await auth.prepareSnippetSave();
+            const required = (value: string) => value.trim() ? undefined : 'Enter a value.';
+            const name = await vscode.window.showInputBox({prompt: 'Snippet name', validateInput: required});
+            if (name === undefined || generation !== initialGeneration) return;
+            const cat = await vscode.window.showInputBox({prompt: 'Category', validateInput: required});
+            if (cat === undefined || generation !== initialGeneration) return;
+            const languageId = editor.document.languageId;
+            const suggested = VS_CODE_LANGUAGE_ALIASES[languageId] ?? languageId;
+            const options = [{label: 'Unspecified', id: ''}, ...Object.entries(languages)
+                .map(([id, label]) => ({label: id === suggested ? label + ' (editor language)' : label, id}))];
+            options.sort((a, b) => Number(b.id === suggested) - Number(a.id === suggested));
+            const language = await vscode.window.showQuickPick(options, {placeHolder: 'Choose a language'});
+            if (!language || generation !== initialGeneration) return;
+            const confirmed = await vscode.window.showWarningMessage('Save selected code to your Snippo account?', {
+                modal: true, detail: 'Only the selected text will be sent to your configured Snippo server.',
+            }, 'Save');
+            if (confirmed !== 'Save' || generation !== initialGeneration) return;
+
+            const response = await save({name, cat, code, language: language.id});
+            if (response.status === 201) {
+                const body = await response.json().catch(() => ({})) as {language?: unknown};
+                if (language.id && !body.language) {
+                    void vscode.window.showWarningMessage('Snippet saved. This server did not save its language.');
+                } else {
+                    void vscode.window.showInformationMessage('Snippet saved to Snippo.');
+                }
+            } else {
+                const message = {
+                    400: 'The server rejected the snippet fields.',
+                    409: 'A snippet with that name already exists.',
+                    413: 'The snippet is too large to save.',
+                    429: 'Snippo is busy. Try again later.',
+                }[response.status] ?? 'Snippo could not confirm the save. Check your library before trying again.';
+                void vscode.window.showWarningMessage(message);
+            }
+        } catch (error) {
+            if (error instanceof SignInRequired) throw error;
+            void vscode.window.showWarningMessage('Snippo could not confirm the save. Check your library before trying again.');
+        } finally {
+            saving = false;
+        }
+    });
 
     register('showSnippets', () => pickSnippets('show'));
     register('searchSnippets', () => pickSnippets('search'));

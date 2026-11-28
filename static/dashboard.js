@@ -53,6 +53,13 @@ for (const toast of [copySuccess, copyError]) {
     });
 }
 
+async function recordCopy(button) {
+    await fetch(button.dataset.recent, {
+        method: 'POST', body: new URLSearchParams({ csrf_token: button.closest('#library-content').dataset.recentCsrf }),
+        cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(5000),
+    });
+}
+
 function bindLibraryControls(root) {
     root.querySelectorAll('[data-close]').forEach(button => {
         button.hidden = false;
@@ -92,6 +99,7 @@ function bindLibraryControls(root) {
             clearCopyNotices();
             try {
                 await navigator.clipboard.writeText(JSON.parse(button.dataset.copy));
+                void recordCopy(button).catch(() => {});
                 copySuccess.hidden = false;
                 copySuccess.querySelector('p').textContent = 'Code copied.';
                 copyTimer = window.setTimeout(() => {
@@ -147,7 +155,7 @@ function draftFrom(content) {
     const composer = content.querySelector('.composer[open]');
     if (composer && content.dataset.editor === 'add') {
         const fields = new FormData(composer.querySelector('form'));
-        const values = ['name', 'cat', 'code'].map(name => [name, fields.get(name)]);
+        const values = ['name', 'cat', 'code', 'language', 'template'].map(name => [name, fields.get(name)]);
         if (values.some(([, value]) => value)) return values;
     }
 }
@@ -169,13 +177,19 @@ function settleFragment(next, notices, options) {
         if (draft) {
             const composer = next.querySelector('.composer');
             composer.open = true;
-            for (const [name, value] of draft) composer.querySelector('form').elements[name].value = value;
+            for (const [name, value] of draft) {
+                const field = composer.querySelector('form').elements[name];
+                if (field.type === 'checkbox') field.checked = value === 'on';
+                else field.value = value;
+            }
         }
     }
     if (!options.keepEditor && options.keepDraft && !options.editorFocus && previous.dataset.editor !== 'add' &&
         next.dataset.location === previous.dataset.location) {
         const oldFields = previous.querySelector('.composer-form').elements;
-        for (const name of ['name', 'cat', 'code']) next.querySelector('.composer-form').elements[name].value = oldFields[name].value;
+        const newFields = next.querySelector('.composer-form').elements;
+        for (const name of ['name', 'cat', 'code', 'language']) newFields[name].value = oldFields[name].value;
+        newFields.template.checked = oldFields.template.checked;
     }
     previous.replaceWith(next);
     if (!options.keepNotices) libraryNotices().replaceWith(notices);

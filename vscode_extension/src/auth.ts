@@ -151,7 +151,7 @@ export class AuthClient {
         });
     }
 
-    async readLibrary<T>(query: string, signal: AbortSignal): Promise<{ items: T; isCurrent: () => Promise<boolean> }> {
+    async readLibrary<T>(query: string, signal: AbortSignal): Promise<{ items: T; isCurrent: () => Promise<boolean>; recordUse: (sno: number) => Promise<void> }> {
         const saved = await this.load();
         signal.throwIfAborted();
         if (!saved) {
@@ -189,7 +189,16 @@ export class AuthClient {
                 entry.result.then(resolve, reject).finally(() => signal.removeEventListener('abort', cancel));
             });
             signal.throwIfAborted();
-            return {items: items as T, isCurrent: async () => this.sameSession(session, await this.load())};
+            return {
+                items: items as T,
+                isCurrent: async () => this.sameSession(session, await this.load()),
+                recordUse: async sno => {
+                    if (Number.isInteger(sno) && this.sameSession(session, await this.load())) {
+                        await this.authorized(session.origin, '/api/snippets/' + sno + '/recent',
+                            session.tokens.access, 'POST', AbortSignal.timeout(5000));
+                    }
+                },
+            };
         } finally {
             entry.readers--;
             if (signal.aborted && !entry.readers) {
@@ -199,6 +208,28 @@ export class AuthClient {
                 }, 50);
             }
         }
+    }
+
+    async prepareSnippetSave() {
+        const saved = await this.load();
+        if (!saved) throw new SignInRequired();
+        return (fields: {name: string; cat: string; code: string; language: string}) => this.serialize(async () => {
+            if (!this.sameSession(saved, await this.load())) {
+                throw new AuthUnavailable('The Snippo session changed.');
+            }
+            const session = saved.tokens.expires <= Date.now() + 30_000 ? await this.refresh(saved) : saved;
+            if (!this.sameSession(session, await this.load())) {
+                throw new AuthUnavailable('The Snippo session changed.');
+            }
+            // A failed or uncertain POST must never be replayed automatically.
+            const response = await this.send(session.origin + '/api/snippets?v=2', {
+                method: 'POST',
+                headers: {Authorization: `Bearer ${session.tokens.access}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify(fields),
+            });
+            if (response.status === 401) throw new SignInRequired();
+            return response;
+        });
     }
 
     cancelLibraryReads() {

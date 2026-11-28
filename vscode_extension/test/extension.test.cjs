@@ -195,7 +195,7 @@ test('browser sign-in gates existing commands, supports cancel, and makes author
     await run('insertSnippet');
     assert.equal(picked.length, 3);
     assert.equal(picked[0][0].label, 'Snippet fixture');
-    assert.equal(requested.find(request => request.search).searchParams.get('search'), 'cat + &');
+    assert.equal(requested.find(request => request.searchParams.has('search')).searchParams.get('search'), 'cat + &');
     assert.equal(inserted, 'print(5)');
 
     let release;
